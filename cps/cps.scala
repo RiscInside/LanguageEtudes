@@ -2,7 +2,10 @@
 // CPS-transformed evaluator appears to be 5 times slower on the benchmark,
 // but it never runs out of stack space. How can its performance be improved?
 
-package cps
+//> using scala 3
+//> using dep org.scalatest::scalatest:3.2.18
+//> using dep org.scalatest::scalatest-funsuite:3.2.18
+//> using javaOpt -Xss10m
 
 import scala.annotation.tailrec
 
@@ -146,12 +149,14 @@ val sub =
   lam((n, m) => m(pred, n))
 val testExpr = sub(church(1000), church(1000)).build()
 
-def benchmark(name: String)(run: => Unit) =
+def benchmark[T](name: String)(run: => T) =
+  import scala.io.AnsiColor._
   val startTime = System.nanoTime()
-  val _ = run
+  println(s"${GREEN}${run}${RESET}")
   val endTime = System.nanoTime()
   println(
-    s"'${name}' took ${(endTime - startTime).doubleValue() / 1000000000.0} seconds"
+    s"${BLUE}'${name}' took ${BOLD}${(endTime - startTime)
+        .doubleValue() / 1000000000.0}${RESET}${BLUE} seconds${RESET}"
   )
 
 object Holes:

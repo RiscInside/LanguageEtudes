@@ -2,7 +2,10 @@
 // (pi) types and type-in-type (U). NbE is used for congruence checking.
 // Holes (`_` terms) can be solved for using basic pattern unification.
 
-package holes
+//> using scala 3
+//> using dep org.scalatest::scalatest:3.2.18
+//> using dep org.scalatest::scalatest-funsuite:3.2.18
+//> using javaOpt -Xss10m
 
 import org.scalatest.funsuite.AnyFunSuite
 import scala.annotation.tailrec
