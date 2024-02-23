@@ -1,7 +1,8 @@
-//> using scala 3
-//> using dep org.scalatest::scalatest:3.2.18
-//> using dep org.scalatest::scalatest-funsuite:3.2.18
-//> using javaOpt -Xss10m
+// Simple typechecker for a dependently typed language with dependent product
+// (pi) types and type-in-type (U). NbE is used for congruence checking.
+// Holes (`_` terms) can be solved for using basic pattern unification.
+
+package holes
 
 import org.scalatest.funsuite.AnyFunSuite
 import scala.annotation.tailrec
@@ -852,6 +853,6 @@ class TypecheckTestSuite extends AnyFunSuite {
 
 }
 
-object Hello:
+object Holes:
   final def main(args: Array[String]) =
     println("Nothing to see here, use scala-cli test instead")

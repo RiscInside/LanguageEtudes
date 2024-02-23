@@ -1,14 +1,19 @@
 # Language etudes ♫
 
-Repository accomodating a bunch of single-file self-contained typechecker/interpreter/compiler implementations. All examples are equipped with tests that you can run with `scala-cli test file.scala`.
-
+Repository accomodating a bunch of single-file typechecker/interpreter/compiler implementations.
 ## Table of contents
+
+### Interpreters
+
+| File | Description |
+|------|-------------|
+| [cps.scala](cps.scala) | Plain and CPS-transformed interpreter in Scala. Run with `scala-cli run cps.scala`. |
 
 ### Typecheckers
 
 | File | Description |
 |------|-------------|
-| [holes.scala](holes.scala) | Basic typechecker for a bare bones dependently typed language based on NbE. Features pattern unification. Heavily inspired by [elaboration-zoo/03-holes](https://github.com/AndrasKovacs/elaboration-zoo/tree/master/03-holes) |
+| [holes.scala](holes.scala) | Basic typechecker for a bare bones dependently typed language using NbE. Based on [elaboration-zoo/03-holes](https://github.com/AndrasKovacs/elaboration-zoo/tree/master/03-holes). Has no frontend yet, but you can run tests with `scala-cli test holes.scala` |
 
 ## Resources
 
