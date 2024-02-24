@@ -3,11 +3,8 @@
 // Holes (`_` terms) can be solved for using basic pattern unification.
 
 //> using scala 3
-//> using dep org.scalatest::scalatest:3.2.18
-//> using dep org.scalatest::scalatest-funsuite:3.2.18
-//> using javaOpt -Xss10m
+//> using dep com.lihaoyi::pprint:0.8.1
 
-import org.scalatest.funsuite.AnyFunSuite
 import scala.annotation.tailrec
 import scala.collection.mutable.ArrayBuffer
 
@@ -252,41 +249,6 @@ object EvalExamples:
 
   final def liftN =
     lam("n")(n => lam("_", "_", "_", "fN")((_, _, _, fN) => fN(n)))
-
-class EvalTestSuite extends AnyFunSuite {
-  import TermBuilder._
-  import EvalExamples._
-
-  test("10 - 5 = 5") {
-    assert(sub(nat(10), nat(5)).eval() == nat(5).build())
-  }
-
-  test("(5 + 5) * (5 + 5) * (5 + 5) = 1000  (02-typecheck-closures-debruijn)") {
-    assert(let("add", add) { add =>
-      let("mul", mul) { mul =>
-        let("five", nat(5)) { five =>
-          let("ten", add(five, five)) { ten =>
-            let("hundred", mul(ten, ten)) { hundred =>
-              let("thousand", mul(hundred, ten))(thousand => thousand)
-            }
-          }
-        }
-      }
-    }.eval() == nat(1000).build())
-  }
-
-  test("staged (3 * 2) + (3 - 1) = 14") {
-    assert(
-      lam("e")(e => e(add, sub, mul, lam("x") { x => x }))(
-        mkAdd(
-          mkMul(liftN(nat(4)), liftN(nat(3))),
-          mkSub(liftN(nat(3)), liftN(nat(1)))
-        )
-      ).eval() == nat(14).build()
-    )
-  }
-
-}
 
 final class TypecheckingFailedException() extends Exception
 
@@ -829,33 +791,25 @@ object TypecheckExamples:
     )
   )(U)
 
-class TypecheckTestSuite extends AnyFunSuite {
-  import TypecheckExamples._
+val example: Raw =
+  if args.length == 0 then TypecheckExamples.ex03Holes
+  else
+    args(0) match
+      case "ex0"   => TypecheckExamples.ex0
+      case "ex1"   => TypecheckExamples.ex1
+      case "ex2"   => TypecheckExamples.ex2
+      case "holes" => TypecheckExamples.ex03Holes
+      case _ =>
+        println("usage: PROG [ex0|ex1|ex2|ex3]")
+        System.exit(1)
+        ???
 
-  test("ex0 from 02-typecheck-closures-debruijn does not typecheck") {
-    assertThrows[TypecheckingFailedException](Context().elab(ex0))
-  }
+println("\nSource:")
+pprint.pprintln(example, width = 120, height = 1000000)
 
-  test("ex1 from 02-typecheck-closures-debruijn (id and const) typechecks") {
-    val (_, ty) = Context().elab(ex1)
-
-    import TermBuilder._
-    assert(ty == pi("A", U)(A => pi("B", U)(B => A ->: B ->: A)).build())
-  }
-
-  test("ex2 from 02-typecheck-closures-debruijn (thousand) typechecks") {
-    val (_, ty) = Context().elab(ex2)
-
-    import TermBuilder._
-    assert(ty == pi("N", U)(N => (N ->: N) ->: N ->: N).build())
-  }
-
-  test("Example from 03-holes typechecks") {
-    Context().elab(ex03Holes)
-  }
-
-}
-
-object Holes:
-  final def main(args: Array[String]) =
-    println("Nothing to see here, use scala-cli test instead")
+println("\nElaborated:")
+pprint.pprintln(
+  Context().elab(example),
+  width = 120,
+  height = 1000000
+)

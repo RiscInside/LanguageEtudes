@@ -1,8 +1,8 @@
-//> using scala "3"
-
 // Plain and CPS-transformed NbE evaluators for plain lambda calculus.
 // CPS-transformed evaluator appears to be 5 times slower on the benchmark,
 // but it never runs out of stack space. How can its performance be improved?
+
+//> using scala 3
 
 import scala.annotation.tailrec
 
