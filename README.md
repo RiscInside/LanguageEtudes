@@ -7,7 +7,7 @@ Repository accomodating a bunch of single-file typechecker/interpreter/compiler 
 
 | File | Description |
 |------|-------------|
-| [scala/cps/cps.scala](scala/cps/cps.scala) | Plain and CPS-transformed NbE lambda calculus interpreters in Scala, along with a performance comparison. Run with `scala-cli run cps.scala`. |
+| [scala/nbe.sc](scala/nbe.sc) | Plain and CPS-transformed NbE lambda calculus interpreters in Scala, along with a performance comparison. Run with `scala-cli run nbe.sc`. |
 
 ### Typecheckers
 
