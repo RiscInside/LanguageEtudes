@@ -1,11 +1,8 @@
+//> using scala "3"
+
 // Plain and CPS-transformed NbE evaluators for plain lambda calculus.
 // CPS-transformed evaluator appears to be 5 times slower on the benchmark,
 // but it never runs out of stack space. How can its performance be improved?
-
-//> using scala 3
-//> using dep org.scalatest::scalatest:3.2.18
-//> using dep org.scalatest::scalatest-funsuite:3.2.18
-//> using javaOpt -Xss10m
 
 import scala.annotation.tailrec
 
@@ -27,35 +24,88 @@ enum Term:
       case Lam(body)     => Val.Lam(env, body)
 
   final def evalCPS(env: Env): Val =
-    enum Cont:
-      case Id
-      case EvalArg(arg: Term, env: Env, cont: Cont)
-      case Apply(funV: Val, cont: Cont)
-
     enum State:
-      case ApplyCont(v: Val, cont: Cont)
-      case Eval(term: Term, env: Env, cont: Cont)
+      case ApplyCont(v: Val, cont: EvalCont)
+      case Eval(term: Term, env: Env, cont: EvalCont)
 
       @tailrec final def apply(): Val = this match
         case ApplyCont(v, cont) =>
           cont match
-            case Cont.Id => v
-            case Cont.EvalArg(arg, env, cont) =>
-              Eval(arg, env, Cont.Apply(v, cont))()
-            case Cont.Apply(funV, cont) =>
+            case EvalCont.Ret => v
+            case EvalCont.EvalArg(arg, env, cont) =>
+              Eval(arg, env, EvalCont.Apply(v, cont))()
+            case EvalCont.Apply(funV, cont) =>
               funV match
                 case Val.Lam(env, body) => Eval(body, v +: env, cont)()
                 case _                  => ApplyCont(Val.App(funV, v), cont)()
         case Eval(term, env, cont) =>
           term match
-            case Var(idx)      => ApplyCont(env(idx), cont)()
-            case App(fun, arg) => Eval(fun, env, Cont.EvalArg(arg, env, cont))()
-            case Lam(body)     => ApplyCont(Val.Lam(env, body), cont)()
+            case Var(idx) => ApplyCont(env(idx), cont)()
+            case App(fun, arg) =>
+              Eval(fun, env, EvalCont.EvalArg(arg, env, cont))()
+            case Lam(body) => ApplyCont(Val.Lam(env, body), cont)()
 
-    State.Eval(this, env, Cont.Id)()
+    State.Eval(this, env, EvalCont.Ret)()
+
+  // We can improve things by getting rid of State ADT and mashing all members
+  // together (aka the C way of representing ADTs). The resulting record can
+  // then be manually unboxed by splitting one state parameter into all of
+  // its members. Since number of parameters rises to 5, I think while
+  // loop actually ends up looking nicer here than @tailrec version.
+  //
+  // Credit to @Labbekak on r/ProgrammingLanguage discord for coming up
+  // with the idea, implementing it, and noticing that it makes a very
+  // significant difference
+  final def evalCPSUgly(env: Env): Val =
+    var isApplyingCont: Boolean = false
+    var cont: EvalCont = EvalCont.Ret
+    var cenv: Env = env
+    var cterm: Term = this
+    var cval: Val = null
+
+    inline def switchToEval(
+        newTerm: Term,
+        newEnv: Env,
+        newCont: EvalCont
+    ): Unit =
+      isApplyingCont = false
+      cterm = newTerm
+      cenv = newEnv
+      cont = newCont
+
+    inline def switchToApplyCont(newVal: Val, newCont: EvalCont): Unit =
+      isApplyingCont = true
+      cval = newVal
+      cont = newCont
+
+    while true do
+      if isApplyingCont then
+        cont match
+          case EvalCont.Ret => return cval
+          case EvalCont.Apply(funV, cont) =>
+            funV match
+              case Val.Lam(env, body) =>
+                switchToEval(body, cval +: env, cont)
+              case _ => switchToApplyCont(Val.App(funV, cval), cont)
+          case EvalCont.EvalArg(arg, env, cont) =>
+            switchToEval(arg, env, EvalCont.Apply(cval, cont))
+      else
+        cterm match
+          case Term.Var(idx) => switchToApplyCont(cenv(idx), cont)
+          case Term.App(fun, arg) =>
+            switchToEval(fun, cenv, EvalCont.EvalArg(arg, cenv, cont))
+          case Term.Lam(body) => switchToApplyCont(Val.Lam(cenv, body), cont)
+
+    ???
 
   def nf(): Term = eval(Vector.empty).quote()
-  def nfCPS(): Term = evalCPS(Vector.empty).quoteCPS()
+  def nfCPS(): Term = evalCPS(Vector.empty).quoteCPS(_.evalCPS(_))
+  def nfCPSUgly(): Term = evalCPSUgly(Vector.empty).quoteCPS(_.evalCPSUgly(_))
+
+enum EvalCont:
+  case Ret
+  case EvalArg(arg: Term, env: Env, cont: EvalCont)
+  case Apply(funV: Val, cont: EvalCont)
 
 enum Val:
   case Neutral(level: Int)
@@ -68,7 +118,10 @@ enum Val:
     case Lam(env, body) =>
       Term.Lam(body.eval(Val.Neutral(envSize) +: env).quote(envSize + 1))
 
-  final def quoteCPS(envSize: Int = 0): Term =
+  def quoteCPS(
+      evaluator: (Term, Env) => Val,
+      envSize: Int = 0
+  ): Term =
     enum Cont:
       case Id
       case PutUnderBinder(cont: Cont)
@@ -96,7 +149,7 @@ enum Val:
               Quote(lhs, envSize, Cont.QuoteRHS(envSize, rhs, cont))()
             case Lam(env, body) =>
               Quote(
-                body.evalCPS(Val.Neutral(envSize) +: env),
+                evaluator(body, Val.Neutral(envSize) +: env),
                 envSize + 1,
                 Cont.PutUnderBinder(cont)
               )()
@@ -134,7 +187,14 @@ object TermBuilder:
 
 import TermBuilder._
 
-def church(n: Int) = lam((s, z) => 1.to(n).foldLeft(z)((arg, _) => s(arg)))
+def church(n: Int) = TermBuilder((level) =>
+  Term.Lam(
+    Term.Lam(
+      1.to(n).foldLeft(Term.Var(0))((arg, _) => Term.App(Term.Var(1), arg))
+    )
+  )
+)
+
 def inc = lam((n, s, z) => s(n(s, z)))
 val add = lam((a, b, s, z) => a(s, b(s, z)))
 val mul = lam((a, b, s, z) => a(b(s), z))
@@ -147,21 +207,47 @@ val pred =
   )
 val sub =
   lam((n, m) => m(pred, n))
-val testExpr = sub(church(1000), church(1000)).build()
+def testExpr(num: Int) =
+  sub(church(num), church(num)).build()
 
-def benchmark[T](name: String)(run: => T) =
+def benchmark[T](name: String, times: Int, warmup: Int = 1)(run: => T) =
   import scala.io.AnsiColor._
+
+  for _ <- 1.to(warmup) do run
   val startTime = System.nanoTime()
-  println(s"${GREEN}${run}${RESET}")
+  for _ <- 1.to(times) do run
   val endTime = System.nanoTime()
   println(
     s"${BLUE}'${name}' took ${BOLD}${(endTime - startTime)
-        .doubleValue() / 1000000000.0}${RESET}${BLUE} seconds${RESET}"
+        .doubleValue() / times / 1000000000.0}${RESET}${BLUE} seconds${RESET}"
   )
 
 object Holes:
   final def main(args: Array[String]) =
-    benchmark("quote (1000 - 1000) with normal NbE interpreter")(testExpr.nf())
-    benchmark("quote (1000 - 1000) with CPS-transformed interpreter")(
-      testExpr.nfCPS()
+    import scala.io.AnsiColor._
+    if args.length < 2 then println("Usage: prog <TERM_SIZE> <RUNS>") else ()
+
+    val n = args(0).toInt
+    val runs = args(1).toInt
+    val expr = testExpr(n)
+
+    try
+      benchmark(s"quote ($n - $n) with with normal NbE interpreter", runs)(
+        expr.nf()
+      )
+    catch
+      case _: StackOverflowError =>
+        println(
+          s"${RED}${BOLD}normal NbE interpreter has overflowed the stack${RESET}"
+        )
+
+    benchmark(s"quote ($n - $n) with CPS-transformed interpreter")(
+      expr.nfCPS()
+    )
+
+    benchmark(
+      s"quote ($n - $n) with a slightly uglier CPS-transformed interpreter",
+      runs
+    )(
+      expr.nfCPSUgly()
     )
