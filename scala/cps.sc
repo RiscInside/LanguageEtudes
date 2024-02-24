@@ -241,7 +241,7 @@ object Holes:
           s"${RED}${BOLD}normal NbE interpreter has overflowed the stack${RESET}"
         )
 
-    benchmark(s"quote ($n - $n) with CPS-transformed interpreter")(
+    benchmark(s"quote ($n - $n) with CPS-transformed interpreter", runs)(
       expr.nfCPS()
     )
 
