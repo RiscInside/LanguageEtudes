@@ -30,25 +30,44 @@ module PlainEval = struct
 end
 
 module NestedEval = struct
+  type ctm =
+    | CTVar of int
+    | CTApp1 of ctm * ctm
+    | CTApp2 of ctm * ctm * ctm
+    | CTApp3 of ctm * ctm * ctm * ctm
+    | CTLam1 of ctm
+    | CTLam2 of ctm
+    | CTLam3 of ctm
+
+  let rec compile : tm -> ctm = function
+    | TVar i -> CTVar i
+    | TApp (TApp (TApp (f, a1), a2), a3) ->
+        CTApp3 (compile f, compile a1, compile a2, compile a3)
+    | TApp (TApp (f, a1), a2) -> CTApp2 (compile f, compile a1, compile a2)
+    | TApp (f, a1) -> CTApp1 (compile f, compile a1)
+    | TLam (TLam (TLam t)) -> CTLam3 (compile t)
+    | TLam (TLam t) -> CTLam2 (compile t)
+    | TLam t -> CTLam1 (compile t)
+
   type value =
-    | VLam1 of tm * value list
-    | VLam2 of tm * value list
-    | VLam3 of tm * value list
+    | VLam1 of ctm * value list
+    | VLam2 of ctm * value list
+    | VLam3 of ctm * value list
     | VNeu of int
     | VApp1 of value * value
     | VApp2 of value * value * value
     | VApp3 of value * value * value * value
 
-  let rec eval (t : tm) (env : value list) : value =
+  let rec eval (t : ctm) (env : value list) : value =
     match t with
-    | TVar idx -> nth env idx
-    | TApp (TApp (TApp (f, a1), a2), a3) ->
+    | CTVar idx -> nth env idx
+    | CTApp3 (f, a1, a2, a3) ->
         apply3 (eval f env) (eval a1 env) (eval a2 env) (eval a3 env)
-    | TApp (TApp (f, a1), a2) -> apply2 (eval f env) (eval a1 env) (eval a2 env)
-    | TApp (f, a1) -> apply (eval f env) (eval a1 env)
-    | TLam (TLam (TLam t)) -> VLam3 (t, env)
-    | TLam (TLam t) -> VLam2 (t, env)
-    | TLam t -> VLam1 (t, env)
+    | CTApp2 (f, a1, a2) -> apply2 (eval f env) (eval a1 env) (eval a2 env)
+    | CTApp1 (f, a1) -> apply (eval f env) (eval a1 env)
+    | CTLam3 t -> VLam3 (t, env)
+    | CTLam2 t -> VLam2 (t, env)
+    | CTLam1 t -> VLam1 (t, env)
 
   and apply (f : value) (a : value) : value =
     match f with
@@ -98,7 +117,8 @@ module NestedEval = struct
             quote bindings t4 )
     | VNeu level -> TVar (bindings - level - 1)
 
-  let nf (t : tm) : tm = quote 0 (eval t [])
+  let nf_compiled (t : ctm) : tm = quote 0 (eval t [])
+  let nf (t : tm) : tm = quote 0 (eval (compile t) [])
 end
 
 module CPSEval = struct
@@ -404,7 +424,6 @@ let benchmark (name : string) ?(runs : int = 5) (expected : tm) (f : int -> tm)
   let rec go totalTime = function
     | 0 -> totalTime
     | n ->
-        Gc.minor ();
         Format.printf "Running '%s' (%i runs remaining)\n@?" name n;
         let startT = Sys.time () in
         let actual = f n in
@@ -416,18 +435,18 @@ let benchmark (name : string) ?(runs : int = 5) (expected : tm) (f : int -> tm)
           exit 1)
         else go (totalTime +. (endT -. startT)) (n - 1)
   in
-
+  Gc.full_major ();
   let res = go 0.0 runs /. float_of_int runs in
   Format.printf "'%s' took %f seconds\n@?" name res
 
-let () =
-  benchmark "plain NbE (1000 - 1000)" (TLam (TLam (TVar 0))) (fun _ ->
+let try_all () =
+  benchmark "plain NbE (1000 - 1000)" (TLam (TLam (TVar 0))) ~runs:10 (fun _ ->
       PlainEval.nf (testTerm 1000));
-  benchmark "nested NbE (1000 - 1000)" (TLam (TLam (TVar 0))) (fun _ ->
+  benchmark "nested NbE (1000 - 1000)" (TLam (TLam (TVar 0))) ~runs:10 (fun _ ->
       NestedEval.nf (testTerm 1000));
   benchmark "plain NbE over marshalled terms (1000 - 1000)"
-    (TLam (TLam (TVar 0))) (fun _ -> MarshalledEval.nf (testTerm 1000));
-  benchmark "cps NbE (1000 - 1000)" (TLam (TLam (TVar 0))) (fun _ ->
+    (TLam (TLam (TVar 0))) ~runs:10 (fun _ -> MarshalledEval.nf (testTerm 1000));
+  benchmark "cps NbE (1000 - 1000)" ~runs:10 (TLam (TLam (TVar 0))) (fun _ ->
       CPSEval.nf (testTerm 1000));
   benchmark "1000 - 1000 on Zinc machine" (TLam (TLam (TVar 0))) (fun _ ->
       Zinc.nf (testTerm 1000));
@@ -447,3 +466,47 @@ let () =
       PlainEval.nf (testTerm 7000));
   benchmark "plain NbE over marshalled terms (7000 - 7000)"
     (TLam (TLam (TVar 0))) ~runs:3 (fun _ -> MarshalledEval.nf (testTerm 7000))
+
+let huge () =
+  benchmark "plain NbE (10000 - 10000)" (TLam (TLam (TVar 0))) ~runs:3 (fun _ ->
+      PlainEval.nf (testTerm 10000));
+  benchmark "nested NbE (10000 - 10000)" (TLam (TLam (TVar 0))) ~runs:3
+    (fun _ -> PlainEval.nf (testTerm 10000))
+
+let many_smol () =
+  let term = testTerm 200 in
+  let compiled = NestedEval.compile term in
+  benchmark "plain NbE (200 - 200) 1000 times" (TLam (TLam (TVar 0))) ~runs:5
+    (fun _ ->
+      let res = ref None in
+      for _ = 0 to 1000 do
+        res := Some (PlainEval.nf term)
+      done;
+      Option.get !res);
+  benchmark "plain NbE (200 - 200) 1000 times" (TLam (TLam (TVar 0))) ~runs:5
+    (fun _ ->
+      let res = ref None in
+      for _ = 0 to 1000 do
+        res := Some (NestedEval.nf_compiled compiled)
+      done;
+      Option.get !res)
+
+let tiny () =
+  let term = testTerm 20 in
+  let compiled = NestedEval.compile term in
+  benchmark "plain NbE (20 - 20) 100000 times" (TLam (TLam (TVar 0))) ~runs:5
+    (fun _ ->
+      let res = ref None in
+      for _ = 0 to 100000 do
+        res := Some (PlainEval.nf term)
+      done;
+      Option.get !res);
+  benchmark "plain NbE (20 - 20) 100000 times" (TLam (TLam (TVar 0))) ~runs:5
+    (fun _ ->
+      let res = ref None in
+      for _ = 0 to 100000 do
+        res := Some (NestedEval.nf_compiled compiled)
+      done;
+      Option.get !res)
+
+let () = tiny ()
