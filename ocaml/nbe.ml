@@ -1,3 +1,44 @@
+(*
+  A collection of NbE interpreters. Each one of them exposes a method called nf
+  that can be used to get a normal form of an LC term. LC terms are encoded
+  with De Brujin indices. NbE semantic domain varies with each interpreter, but
+  the default one (based on De Brujin levels) is given below.
+
+  Table of contents:
+
+  - The most basic NbE interpreter. Sufficiently fast, solid choice.
+
+  - NbE interpreter that does a precompilation step to discover nested
+    applications/abstractions. On a huge example (10000 - 10000) this
+    optimization gives 20% speedup
+
+  - CPS NbE interpreter. Roughly the same speed as the basic one +
+    is guaranteed to use constant amount of stack space. It does allocate
+    a lot however, so I noticed that sometimes plain eval would run
+    successfully, whereas CPS version would cause OOM killer to nuke OCaml
+    process
+  
+  - Zinc based NbE interpreter. Implementation of the Zinc machine
+    extended with some ad hoc rules to do NbE. I am not actually sure that
+    rules are correct, but they seem to be. Alas, its two times slower than
+    PlainEval, so not worth it regardless. Perhaps maybe in C?
+  
+  - MarshalledTerm. This "marshals" term into a byte array and then evaluates
+    the marshalled term. This appears to run slightly faster than plain eval,
+    but I had to steal some external function declarations from Bytes module
+    to make that happen
+
+  Some ideas I ruled out
+
+  - Unrolling VApp into VApp1, VApp2, VApp3, etc in NestedEval. Didn't actually
+    make a difference and in a normal NbE interpreter there would be a big
+    spine instead.
+
+  Some ideas I would like to try
+
+  - Encoding (TVar v) variant as Ocaml Integer to save up on space.
+*)
+
 type tm = TLam of tm | TApp of tm * tm | TVar of int
 type value = VLam of tm * value list | VNeu of int | VApp of value * value
 
@@ -9,6 +50,7 @@ let rec pp_tm (fmt : Format.formatter) (t : tm) : unit =
 
 open List
 
+(* Plain NbE evaluation, nothing fancy *)
 module PlainEval = struct
   let rec eval (t : tm) (env : value list) : value =
     match t with
@@ -29,6 +71,7 @@ module PlainEval = struct
   let nf (t : tm) : tm = quote 0 (eval t [])
 end
 
+(* Some preprocessing to handle applications of different arities *)
 module NestedEval = struct
   type ctm =
     | CTVar of int
@@ -54,9 +97,8 @@ module NestedEval = struct
     | VLam2 of ctm * value list
     | VLam3 of ctm * value list
     | VNeu of int
-    | VApp1 of value * value
-    | VApp2 of value * value * value
-    | VApp3 of value * value * value * value
+    (* Unwrapping VApps is not worth it practically since this will be a spine anyway*)
+    | VApp of value * value
 
   let rec eval (t : ctm) (env : value list) : value =
     match t with
@@ -74,21 +116,21 @@ module NestedEval = struct
     | VLam1 (fb, fenv) -> eval fb (a :: fenv)
     | VLam2 (fb, fenv) -> VLam1 (fb, a :: fenv)
     | VLam3 (fb, fenv) -> VLam2 (fb, a :: fenv)
-    | v -> VApp1 (v, a)
+    | v -> VApp (v, a)
 
   and apply2 (f : value) (a1 : value) (a2 : value) =
     match f with
     | VLam1 (fb, fenv) -> apply (eval fb (a1 :: fenv)) a2
     | VLam2 (fb, fenv) -> eval fb (a2 :: a1 :: fenv)
     | VLam3 (fb, fenv) -> VLam1 (fb, a2 :: a1 :: fenv)
-    | f -> VApp2 (f, a1, a2)
+    | f -> VApp (VApp (f, a1), a2)
 
   and apply3 (f : value) (a1 : value) (a2 : value) (a3 : value) =
     match f with
     | VLam1 (fb, fenv) -> apply2 (eval fb (a1 :: fenv)) a2 a3
     | VLam2 (fb, fenv) -> apply (eval fb (a2 :: a1 :: fenv)) a3
     | VLam3 (fb, fenv) -> eval fb (a3 :: a2 :: a1 :: fenv)
-    | f -> VApp3 (f, a1, a2, a3)
+    | f -> VApp (VApp (VApp (f, a1), a2), a3)
 
   let rec quote (bindings : int) (v : value) : tm =
     match v with
@@ -108,13 +150,7 @@ module NestedEval = struct
                       (VNeu (bindings + 2)
                       :: VNeu (bindings + 1)
                       :: VNeu bindings :: env)))))
-    | VApp1 (t1, t2) -> TApp (quote bindings t1, quote bindings t2)
-    | VApp2 (t1, t2, t3) ->
-        TApp (TApp (quote bindings t1, quote bindings t2), quote bindings t3)
-    | VApp3 (t1, t2, t3, t4) ->
-        TApp
-          ( TApp (TApp (quote bindings t1, quote bindings t2), quote bindings t3),
-            quote bindings t4 )
+    | VApp (t1, t2) -> TApp (quote bindings t1, quote bindings t2)
     | VNeu level -> TVar (bindings - level - 1)
 
   let nf_compiled (t : ctm) : tm = quote 0 (eval t [])
@@ -165,7 +201,7 @@ module CPSEval = struct
   let nf (t : tm) : tm = quote 0 (eval t [] EId) QId
 end
 
-(* TODO: this is currently slower than it should be. Investigate *)
+(* NbE with Zinc machine. This version is actually two times slower than plain NbE interpreter. *)
 module Zinc = struct
   type ins =
     | Grab
@@ -509,4 +545,4 @@ let tiny () =
       done;
       Option.get !res)
 
-let () = tiny ()
+let () = huge ()
