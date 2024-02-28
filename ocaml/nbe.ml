@@ -73,6 +73,95 @@ module CPSEval = struct
   let nf (t : tm) : tm = quote 0 (eval t [] EId) QId
 end
 
+(* TODO: this is currently slower than it should be. Investigate *)
+module Zinc = struct
+  type ins =
+    | Grab
+    | Return
+    | Access of int
+    | Closure of ins list
+    | PushRetAddr of ins list
+    | TailApply
+
+  let compile_var (n : int) : ins = Access n
+
+  let rec compile (t : tm) (cont : ins list) : ins list =
+    match t with
+    | TVar i -> compile_var i :: cont
+    | TApp (f, a) -> PushRetAddr cont :: compile_app f a
+    | TLam b -> Closure (Grab :: compile_tail b) :: cont
+
+  and compile_app (f : tm) (a : tm) : ins list =
+    match f with
+    | TApp (f', a') -> compile a (compile_app f' a')
+    | f -> compile a (compile f [ TailApply ])
+
+  and compile_tail : tm -> ins list = function
+    | TLam b -> Grab :: compile_tail b
+    | TApp (f, a) -> compile_app f a
+    | TVar i -> [ compile_var i; Return ]
+
+  type value =
+    | VNeu of int
+    | VApp of value * value
+    | VLam of ins list * value list
+
+  type stack =
+    | SNil
+    | SValue of (value * stack)
+    | SMarker of ins list * value list * stack
+
+  exception InterpreterError of ins list * stack * value list
+  exception CantQuoteClosure of ins list * value list
+
+  let rec interpret (insns : ins list) (stack : stack) (env : value list) :
+      value =
+    match (insns, stack, env) with
+    | [], SValue (res, stack), _ -> res
+    (* *)
+    | Grab :: insns, SMarker (insns', env', stack), env ->
+        interpret insns' (SValue (VLam (Grab :: insns, env), stack)) env'
+    | Grab :: insns, SValue (value, stack), env ->
+        interpret insns stack (value :: env)
+    | Grab :: _, SNil, env -> VLam (insns, env)
+    (* *)
+    | Return :: _, SValue (VLam (insns, env), stack), _ ->
+        interpret insns stack env
+    | Return :: _, SValue (value, SMarker (insns, env, stack)), _ ->
+        interpret insns (SValue (value, stack)) env
+    | Return :: _, SValue (value, SNil), _ -> value
+    (* *)
+    | Access i :: insns, stack, env ->
+        interpret insns (SValue (nth env i, stack)) env
+    (* *)
+    | Closure insns' :: insns, stack, env ->
+        interpret insns (SValue (VLam (insns', env), stack)) env
+    (* *)
+    | PushRetAddr insns' :: insns, stack, env ->
+        interpret insns (SMarker (insns', env, stack)) env
+    (* *)
+    | TailApply :: _, SValue (VLam (insns, env), stack), _ ->
+        interpret insns stack env
+    (* Building applications until stack becomes empty or we see a marker *)
+    | TailApply :: _, SValue (v, SValue (i, stack)), env ->
+        interpret insns (SValue (VApp (v, i), stack)) env
+    | TailApply :: _, SValue (v, SNil), _ -> v
+    | TailApply :: _, SValue (v, SMarker (insns, env, stack)), _ ->
+        interpret insns (SValue (v, stack)) env
+    (* *)
+    | _, _, _ -> raise (InterpreterError (insns, stack, env))
+
+  let rec quote (bindings : int) : value -> tm = function
+    | VNeu lvl -> TVar (bindings - lvl - 1)
+    | VApp (v1, v2) -> TApp (quote bindings v1, quote bindings v2)
+    | VLam (Grab :: insns, env) ->
+        TLam
+          (quote (bindings + 1) (interpret insns SNil (VNeu bindings :: env)))
+    | VLam (insns, env) -> raise (CantQuoteClosure (insns, env))
+
+  let rec nf (t : tm) : tm = quote 0 (interpret (compile t []) SNil [])
+end
+
 module TB : sig
   type tb
 
@@ -160,11 +249,17 @@ let () =
       PlainEval.nf (testTerm 1000));
   benchmark "cps NbE (1000 - 1000)" (TLam (TLam (TVar 0))) (fun _ ->
       CPSEval.nf (testTerm 1000));
+  benchmark "1000 - 1000 on Zinc machine" (TLam (TLam (TVar 0))) (fun _ ->
+      Zinc.nf (testTerm 1000));
   benchmark "plain NbE (3000 - 3000)" (TLam (TLam (TVar 0))) (fun _ ->
       PlainEval.nf (testTerm 3000));
   benchmark "cps NbE (3000 - 3000)" (TLam (TLam (TVar 0))) (fun _ ->
       CPSEval.nf (testTerm 3000));
-  benchmark "plain NbE (10000 - 10000)" (TLam (TLam (TVar 0))) ~runs:1 (fun _ ->
-      PlainEval.nf (testTerm 10000));
-  benchmark "cps NbE (10000 - 10000)" (TLam (TLam (TVar 0))) ~runs:1 (fun _ ->
-      CPSEval.nf (testTerm 10000))
+  benchmark "3000 - 3000 on Zinc machine" (TLam (TLam (TVar 0))) (fun _ ->
+      Zinc.nf (testTerm 3000));
+  benchmark "plain NbE (7000 - 7000)" (TLam (TLam (TVar 0))) ~runs:1 (fun _ ->
+      PlainEval.nf (testTerm 7000));
+  benchmark "cps NbE (7000 - 7000)" (TLam (TLam (TVar 0))) ~runs:1 (fun _ ->
+      CPSEval.nf (testTerm 7000));
+  benchmark "7000 - 7000 on Zinc machine" (TLam (TLam (TVar 0))) ~runs:1
+    (fun _ -> Zinc.nf (testTerm 7000))

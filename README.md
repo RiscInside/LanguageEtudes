@@ -8,7 +8,7 @@ Repository accomodating a bunch of single-file typechecker/interpreter/compiler 
 | File | Description |
 |------|-------------|
 | [scala/nbe.sc](scala/nbe.sc) | Plain and CPS-transformed NbE lambda calculus interpreters in Scala, along with a performance comparison. Run with `scala-cli run nbe.sc -- 1000 5`. |
-| [ocaml/nbe.ml](scala/nbe.sc) | Same thing in OCaml. Run with `ocamlbuild ocaml/cps.native --`. |
+| [ocaml/nbe.ml](scala/nbe.sc) | Plain, CPS-transformed, and Zinc-machine backed NbE interpreters for LC in Ocaml. Run with `ocamlbuild ocaml/nbe.native --`. |
 
 ### Typecheckers
 
