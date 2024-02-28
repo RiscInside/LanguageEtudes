@@ -162,6 +162,109 @@ module Zinc = struct
   let rec nf (t : tm) : tm = quote 0 (interpret (compile t []) SNil [])
 end
 
+(* Uhh *)
+external unsafe_set_uint16_ne : bytes -> int -> int -> unit
+  = "%caml_bytes_set16u"
+
+external unsafe_get_uint16_ne : bytes -> int -> int = "%caml_bytes_get16u"
+
+(* Converting terms to byte sequences *)
+module TermMarshal = struct
+  let byte_var_boundary : int = 0xfc
+  let short_var_marker : char = '\xfd'
+  let app_byte : char = '\xfe'
+  let lam_byte : char = '\xff'
+
+  type writer = { mutable bytes : bytes; mutable offset : int }
+
+  let new_writer () : writer = { bytes = Bytes.create 128; offset = 0 }
+
+  let grow (w : writer) : unit =
+    w.bytes <- Bytes.extend w.bytes 0 (Bytes.length w.bytes)
+
+  let rec write (w : writer) (size : int) (f : bytes -> int -> unit) : unit =
+    if Bytes.length w.bytes < w.offset + size then grow w else ();
+    f w.bytes w.offset;
+    w.offset <- w.offset + size
+
+  let write_char (w : writer) (c : char) : unit =
+    write w 1 (fun b i -> Bytes.unsafe_set b i c)
+
+  let write_uint16 (w : writer) (v : int) : unit =
+    write w 2 (fun b i -> unsafe_set_uint16_ne b i v)
+
+  let make_uint16_hole (w : writer) : int =
+    let offset = w.offset in
+    write_uint16 w 0;
+    offset
+
+  let fill_uint16_hole (w : writer) (hole : int) (v : int) : unit =
+    Bytes.set_uint16_ne w.bytes hole v
+
+  exception MarshallingError of string
+
+  let rec marshal (w : writer) (t : tm) : int =
+    let rec go (w : writer) : tm -> unit = function
+      | TApp (t1, t2) ->
+          let start_offset = w.offset in
+          write_char w app_byte;
+          let offset_hole = make_uint16_hole w in
+          go w t1;
+          fill_uint16_hole w offset_hole (w.offset - start_offset);
+          go w t2
+      | TLam b ->
+          write_char w lam_byte;
+          go w b
+      | TVar v ->
+          if v <= byte_var_boundary then write_char w (char_of_int v)
+          else if v < 65536 then (
+            write_char w short_var_marker;
+            write_uint16 w v)
+          else raise (MarshallingError "variable too big")
+    in
+
+    let offset = w.offset in
+    go w t;
+    offset
+end
+
+module MarshalledEval = struct
+  (* int in VLam represents byte offset into the buffer where marshalled term starts *)
+  type value = VLam of int * value list | VNeu of int | VApp of value * value
+
+  let rec eval (b : bytes) (pc : int) (env : value list) : value =
+    match Bytes.unsafe_get b pc with
+    | '\xfd' ->
+        (* Far variable access *)
+        nth env (unsafe_get_uint16_ne b (pc + 1))
+    | '\xfe' ->
+        (* Function application *)
+        let a_offset = unsafe_get_uint16_ne b (pc + 1) in
+        let f = eval b (pc + 3) env in
+        let a = eval b (pc + a_offset) env in
+        apply b f a
+    | '\xff' ->
+        (* Lamdba abstraction *)
+        VLam (pc + 1, env)
+    | c ->
+        (* Close variable access *)
+        nth env (int_of_char c)
+
+  and apply (b : bytes) (f : value) (a : value) : value =
+    match f with VLam (off, env) -> eval b off (a :: env) | _ -> VApp (f, a)
+
+  let rec quote (b : bytes) (bindings : int) : value -> tm = function
+    | VNeu lvl -> TVar (bindings - lvl - 1)
+    | VApp (v1, v2) -> TApp (quote b bindings v1, quote b bindings v2)
+    | VLam (off, env) ->
+        TLam (quote b (bindings + 1) (eval b off (VNeu bindings :: env)))
+
+  let rec nf (t : tm) : tm =
+    let w = TermMarshal.new_writer () in
+    let offset = TermMarshal.marshal w t in
+    quote w.bytes 0 (eval w.bytes offset [])
+end
+
 module TB : sig
   type tb
 
@@ -247,19 +350,23 @@ let benchmark (name : string) ?(runs : int = 5) (expected : tm) (f : int -> tm)
 let () =
   benchmark "plain NbE (1000 - 1000)" (TLam (TLam (TVar 0))) (fun _ ->
       PlainEval.nf (testTerm 1000));
+  benchmark "plain NbE over marshalled terms (1000 - 1000)"
+    (TLam (TLam (TVar 0))) (fun _ -> MarshalledEval.nf (testTerm 1000));
   benchmark "cps NbE (1000 - 1000)" (TLam (TLam (TVar 0))) (fun _ ->
       CPSEval.nf (testTerm 1000));
   benchmark "1000 - 1000 on Zinc machine" (TLam (TLam (TVar 0))) (fun _ ->
       Zinc.nf (testTerm 1000));
   benchmark "plain NbE (3000 - 3000)" (TLam (TLam (TVar 0))) (fun _ ->
       PlainEval.nf (testTerm 3000));
+  benchmark "plain NbE over marshalled terms (3000 - 3000)"
+    (TLam (TLam (TVar 0))) (fun _ -> MarshalledEval.nf (testTerm 3000));
   benchmark "cps NbE (3000 - 3000)" (TLam (TLam (TVar 0))) (fun _ ->
       CPSEval.nf (testTerm 3000));
   benchmark "3000 - 3000 on Zinc machine" (TLam (TLam (TVar 0))) (fun _ ->
       Zinc.nf (testTerm 3000));
-  benchmark "plain NbE (7000 - 7000)" (TLam (TLam (TVar 0))) ~runs:1 (fun _ ->
+  benchmark "plain NbE (7000 - 7000)" (TLam (TLam (TVar 0))) ~runs:3 (fun _ ->
       PlainEval.nf (testTerm 7000));
-  benchmark "cps NbE (7000 - 7000)" (TLam (TLam (TVar 0))) ~runs:1 (fun _ ->
-      CPSEval.nf (testTerm 7000));
-  benchmark "7000 - 7000 on Zinc machine" (TLam (TLam (TVar 0))) ~runs:1
+  benchmark "plain NbE over marshalled terms (7000 - 7000)"
+    (TLam (TLam (TVar 0))) ~runs:3 (fun _ -> MarshalledEval.nf (testTerm 7000));
+  benchmark "7000 - 7000 on Zinc machine" (TLam (TLam (TVar 0))) ~runs:3
     (fun _ -> Zinc.nf (testTerm 7000))
