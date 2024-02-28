@@ -13,7 +13,8 @@ enum Term:
   case App(fun: Term, arg: Term)
   case Lam(body: Term)
 
-  final def eval(env: Env): Val =
+  // Vanilla NbE evaluator
+  final def eval(env: Env = Vector.empty): Val =
     def apply(lhs: Val, rhs: Val): Val = lhs match
       case Val.Lam(env, body) => body.eval(rhs +: env)
       case _                  => Val.App(lhs, rhs)
@@ -23,7 +24,9 @@ enum Term:
       case App(fun, arg) => apply(fun.eval(env), arg.eval(env))
       case Lam(body)     => Val.Lam(env, body)
 
-  final def evalCPS(env: Env): Val =
+  // Same evaluator after applying CPS transformation and defunctionalizing
+  // continuations (CPS version without defunctionalization wouldn't be tail recursive)
+  final def evalCPS(env: Env = Vector.empty): Val =
     enum State:
       case ApplyCont(v: Val, cont: EvalCont)
       case Eval(term: Term, env: Env, cont: EvalCont)
@@ -56,7 +59,7 @@ enum Term:
   // Credit to @Labbekak on r/ProgrammingLanguage discord for coming up
   // with the idea, implementing it, and noticing that it makes a very
   // significant difference
-  final def evalCPSUgly(env: Env): Val =
+  final def evalCPSUgly(env: Env = Vector.empty): Val =
     var isApplyingCont: Boolean = false
     var cont: EvalCont = EvalCont.Ret
     var cenv: Env = env
@@ -95,12 +98,34 @@ enum Term:
           case Term.App(fun, arg) =>
             switchToEval(fun, cenv, EvalCont.EvalArg(arg, cenv, cont))
           case Term.Lam(body) => switchToApplyCont(Val.Lam(cenv, body), cont)
-
     ???
 
-  def nf(): Term = eval(Vector.empty).quote()
-  def nfCPS(): Term = evalCPS(Vector.empty).quoteCPS(_.evalCPS(_))
-  def nfCPSUgly(): Term = evalCPSUgly(Vector.empty).quoteCPS(_.evalCPSUgly(_))
+  // Suspended evaluation. I stole the idea from https://github.com/j-mie6/parsley -
+  // parser combinator library that guarantees bounded stack space usage
+  final def evalSuspended(env: Env = Vector.empty): Val =
+    def evalToSuspended[R](
+        term: Term,
+        env: Env
+    ): SuspendCont[Val, R] =
+      term match
+        case Var(idx) => SuspendCont.pure(env(idx))
+        case App(fun, arg) =>
+          SuspendCont.lazyBind(evalToSuspended(fun, env))(fVal =>
+            SuspendCont.lazyBind(evalToSuspended(arg, env))(aVal =>
+              fVal match
+                case Val.Lam(env, body) => evalToSuspended(body, aVal +: env)
+                case _                  => SuspendCont.pure(Val.App(fVal, aVal))
+            )
+          )
+        case Lam(body) => SuspendCont.pure(Val.Lam(env, body))
+
+    SuspendCont.run(evalToSuspended(this, env))
+
+  final def nf(): Term = eval().quote(_.eval(_))
+  final def nfCPS(): Term = evalCPS().quote(_.evalCPS(_))
+  final def nfCPSUgly(): Term =
+    evalCPSUgly().quote(_.evalCPSUgly(_))
+  final def nfSuspended(): Term = evalSuspended().quote(_.evalSuspended(_))
 
 enum EvalCont:
   case Ret
@@ -112,49 +137,45 @@ enum Val:
   case App(lhs: Val, rhs: Val)
   case Lam(env: Env, body: Term)
 
-  final def quote(envSize: Int = 0): Term = this match
+  final def quote(eval: (Term, Env) => Val, envSize: Int = 0): Term = this match
     case Neutral(level) => Term.Var(envSize - level - 1)
-    case App(lhs, rhs)  => Term.App(lhs.quote(envSize), rhs.quote(envSize))
+    case App(lhs, rhs) =>
+      Term.App(lhs.quote(eval, envSize), rhs.quote(eval, envSize))
     case Lam(env, body) =>
-      Term.Lam(body.eval(Val.Neutral(envSize) +: env).quote(envSize + 1))
+      Term.Lam(eval(body, Val.Neutral(envSize) +: env).quote(eval, envSize + 1))
 
-  def quoteCPS(
-      evaluator: (Term, Env) => Val,
-      envSize: Int = 0
-  ): Term =
-    enum Cont:
-      case Id
-      case PutUnderBinder(cont: Cont)
-      case QuoteRHS(envSize: Int, rhs: Val, cont: Cont)
-      case BuildQuotedApp(lhs: Term, cont: Cont)
+enum DoThis[A]:
+  case RightNow(res: A)
+  case Later(f: () => DoThis[A])
 
-    enum State:
-      case ApplyCont(term: Term, cont: Cont)
-      case Quote(v: Val, envSize: Int, cont: Cont)
+  @tailrec final def run: A = this match
+    case RightNow(v) => v
+    case Later(f)    => f().run
 
-      @tailrec final def apply(): Term = this match
-        case ApplyCont(term, cont) =>
-          cont match
-            case Cont.Id                   => term
-            case Cont.PutUnderBinder(cont) => ApplyCont(Term.Lam(term), cont)()
-            case Cont.QuoteRHS(envSize, rhs, cont) =>
-              Quote(rhs, envSize, Cont.BuildQuotedApp(term, cont))()
-            case Cont.BuildQuotedApp(lhs, cont) =>
-              ApplyCont(Term.App(lhs, term), cont)()
-        case Quote(v, envSize, cont) =>
-          v match
-            case Neutral(level) =>
-              ApplyCont(Term.Var(envSize - level - 1), cont)()
-            case App(lhs, rhs) =>
-              Quote(lhs, envSize, Cont.QuoteRHS(envSize, rhs, cont))()
-            case Lam(env, body) =>
-              Quote(
-                evaluator(body, Val.Neutral(envSize) +: env),
-                envSize + 1,
-                Cont.PutUnderBinder(cont)
-              )()
+  // Helper method that calculates how many suspensions we went through
+  @tailrec final def runAndCount(acc: Int = 0): (A, Int) = this match
+    case RightNow(v) => (v, acc)
+    case Later(f)    => f().runAndCount(acc + 1)
 
-    State.Quote(this, envSize, Cont.Id)()
+type SuspendCont[A, R] = (A => DoThis[R]) => DoThis[R]
+
+object SuspendCont {
+  def toDo[A](cont: SuspendCont[A, A]): DoThis[A] = cont(DoThis.RightNow(_))
+
+  def run[A](cont: SuspendCont[A, A]): A = toDo(cont).run
+
+  def pure[A, R](value: => A): SuspendCont[A, R] = f => f(value)
+
+  def lazyMap[A, B, R](cont: => SuspendCont[A, R])(
+      f: A => B
+  ): SuspendCont[B, R] =
+    c => DoThis.Later(() => cont(a => SuspendCont.pure(f(a))(c)))
+
+  def lazyBind[A, B, R](cont: => SuspendCont[A, R])(
+      f: A => SuspendCont[B, R]
+  ): SuspendCont[B, R] =
+    c => DoThis.Later(() => cont(a => f(a)(c)))
+}
 
 class TermBuilder(private val f: (Int) => Term):
   final def build(): Term = f(0)
@@ -222,32 +243,37 @@ def benchmark[T](name: String, times: Int, warmup: Int = 1)(run: => T) =
         .doubleValue() / times / 1000000000.0}${RESET}${BLUE} seconds${RESET}"
   )
 
-object Holes:
-  final def main(args: Array[String]) =
-    import scala.io.AnsiColor._
-    if args.length < 2 then println("Usage: prog <TERM_SIZE> <RUNS>") else ()
+import scala.io.AnsiColor._
+if args.length < 2 then println("Usage: prog <TERM_SIZE> <RUNS>") else ()
 
-    val n = args(0).toInt
-    val runs = args(1).toInt
-    val expr = testExpr(n)
+val n = args(0).toInt
+val runs = args(1).toInt
+val expr: Term = testExpr(n)
 
-    try
-      benchmark(s"quote ($n - $n) with with normal NbE interpreter", runs)(
-        expr.nf()
-      )
-    catch
-      case _: StackOverflowError =>
-        println(
-          s"${RED}${BOLD}normal NbE interpreter has overflowed the stack${RESET}"
-        )
-
-    benchmark(s"quote ($n - $n) with CPS-transformed interpreter", runs)(
-      expr.nfCPS()
+try
+  benchmark(s"quote ($n - $n) with with normal NbE interpreter", runs)(
+    expr.nf()
+  )
+catch
+  case _: StackOverflowError =>
+    println(
+      s"${RED}${BOLD}normal NbE interpreter has overflowed the stack${RESET}"
     )
 
-    benchmark(
-      s"quote ($n - $n) with a slightly uglier CPS-transformed interpreter",
-      runs
-    )(
-      expr.nfCPSUgly()
-    )
+benchmark(s"quote ($n - $n) with CPS-transformed interpreter", runs)(
+  expr.nfCPS()
+)
+
+benchmark(
+  s"quote ($n - $n) with a slightly uglier CPS-transformed interpreter",
+  runs
+)(
+  expr.nfCPSUgly()
+)
+
+benchmark(
+  s"quote ($n - $n) with CPS-interpreter using suspensions",
+  runs
+)(
+  expr.nfSuspended()
+)
