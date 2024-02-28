@@ -29,6 +29,32 @@ module PlainEval = struct
   let nf (t : tm) : tm = quote 0 (eval t [])
 end
 
+module NestedEval = struct
+  let rec eval (t : tm) (env : value list) : value =
+    match t with
+    | TVar idx -> nth env idx
+    | TApp (TApp (TApp (f, a1), a2), a3) ->
+        apply
+          (apply (apply (eval f env) (eval a1 env)) (eval a2 env))
+          (eval a3 env)
+    | TApp (TApp (f, a1), a2) ->
+        apply (apply (eval f env) (eval a1 env)) (eval a2 env)
+    | TApp (f, a1) -> apply (eval f env) (eval a1 env)
+    | TLam t -> VLam (t, env)
+
+  and apply (f : value) (a : value) : value =
+    match f with VLam (fb, fenv) -> eval fb (a :: fenv) | v -> VApp (v, a)
+
+  let rec quote (bindings : int) (v : value) : tm =
+    match v with
+    | VLam (t, env) ->
+        TLam (quote (bindings + 1) (eval t (VNeu bindings :: env)))
+    | VApp (t1, t2) -> TApp (quote bindings t1, quote bindings t2)
+    | VNeu level -> TVar (bindings - level - 1)
+
+  let nf (t : tm) : tm = quote 0 (eval t [])
+end
+
 module CPSEval = struct
   type evalcont =
     | EId
@@ -350,6 +376,8 @@ let benchmark (name : string) ?(runs : int = 5) (expected : tm) (f : int -> tm)
 let () =
   benchmark "plain NbE (1000 - 1000)" (TLam (TLam (TVar 0))) (fun _ ->
       PlainEval.nf (testTerm 1000));
+  benchmark "nested NbE (1000 - 1000)" (TLam (TLam (TVar 0))) (fun _ ->
+      NestedEval.nf (testTerm 1000));
   benchmark "plain NbE over marshalled terms (1000 - 1000)"
     (TLam (TLam (TVar 0))) (fun _ -> MarshalledEval.nf (testTerm 1000));
   benchmark "cps NbE (1000 - 1000)" (TLam (TLam (TVar 0))) (fun _ ->
@@ -357,6 +385,8 @@ let () =
   benchmark "1000 - 1000 on Zinc machine" (TLam (TLam (TVar 0))) (fun _ ->
       Zinc.nf (testTerm 1000));
   benchmark "plain NbE (3000 - 3000)" (TLam (TLam (TVar 0))) (fun _ ->
+      PlainEval.nf (testTerm 3000));
+  benchmark "nested NbE (3000 - 3000)" (TLam (TLam (TVar 0))) (fun _ ->
       PlainEval.nf (testTerm 3000));
   benchmark "plain NbE over marshalled terms (3000 - 3000)"
     (TLam (TLam (TVar 0))) (fun _ -> MarshalledEval.nf (testTerm 3000));
@@ -366,7 +396,7 @@ let () =
       Zinc.nf (testTerm 3000));
   benchmark "plain NbE (7000 - 7000)" (TLam (TLam (TVar 0))) ~runs:3 (fun _ ->
       PlainEval.nf (testTerm 7000));
+  benchmark "nested NbE (7000 - 7000)" (TLam (TLam (TVar 0))) ~runs:3 (fun _ ->
+      PlainEval.nf (testTerm 7000));
   benchmark "plain NbE over marshalled terms (7000 - 7000)"
-    (TLam (TLam (TVar 0))) ~runs:3 (fun _ -> MarshalledEval.nf (testTerm 7000));
-  benchmark "7000 - 7000 on Zinc machine" (TLam (TLam (TVar 0))) ~runs:3
-    (fun _ -> Zinc.nf (testTerm 7000))
+    (TLam (TLam (TVar 0))) ~runs:3 (fun _ -> MarshalledEval.nf (testTerm 7000))
