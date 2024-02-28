@@ -30,26 +30,72 @@ module PlainEval = struct
 end
 
 module NestedEval = struct
+  type value =
+    | VLam1 of tm * value list
+    | VLam2 of tm * value list
+    | VLam3 of tm * value list
+    | VNeu of int
+    | VApp1 of value * value
+    | VApp2 of value * value * value
+    | VApp3 of value * value * value * value
+
   let rec eval (t : tm) (env : value list) : value =
     match t with
     | TVar idx -> nth env idx
     | TApp (TApp (TApp (f, a1), a2), a3) ->
-        apply
-          (apply (apply (eval f env) (eval a1 env)) (eval a2 env))
-          (eval a3 env)
-    | TApp (TApp (f, a1), a2) ->
-        apply (apply (eval f env) (eval a1 env)) (eval a2 env)
+        apply3 (eval f env) (eval a1 env) (eval a2 env) (eval a3 env)
+    | TApp (TApp (f, a1), a2) -> apply2 (eval f env) (eval a1 env) (eval a2 env)
     | TApp (f, a1) -> apply (eval f env) (eval a1 env)
-    | TLam t -> VLam (t, env)
+    | TLam (TLam (TLam t)) -> VLam3 (t, env)
+    | TLam (TLam t) -> VLam2 (t, env)
+    | TLam t -> VLam1 (t, env)
 
   and apply (f : value) (a : value) : value =
-    match f with VLam (fb, fenv) -> eval fb (a :: fenv) | v -> VApp (v, a)
+    match f with
+    | VLam1 (fb, fenv) -> eval fb (a :: fenv)
+    | VLam2 (fb, fenv) -> VLam1 (fb, a :: fenv)
+    | VLam3 (fb, fenv) -> VLam2 (fb, a :: fenv)
+    | v -> VApp1 (v, a)
+
+  and apply2 (f : value) (a1 : value) (a2 : value) =
+    match f with
+    | VLam1 (fb, fenv) -> apply (eval fb (a1 :: fenv)) a2
+    | VLam2 (fb, fenv) -> eval fb (a2 :: a1 :: fenv)
+    | VLam3 (fb, fenv) -> VLam1 (fb, a2 :: a1 :: fenv)
+    | f -> VApp2 (f, a1, a2)
+
+  and apply3 (f : value) (a1 : value) (a2 : value) (a3 : value) =
+    match f with
+    | VLam1 (fb, fenv) -> apply2 (eval fb (a1 :: fenv)) a2 a3
+    | VLam2 (fb, fenv) -> apply (eval fb (a2 :: a1 :: fenv)) a3
+    | VLam3 (fb, fenv) -> eval fb (a3 :: a2 :: a1 :: fenv)
+    | f -> VApp3 (f, a1, a2, a3)
 
   let rec quote (bindings : int) (v : value) : tm =
     match v with
-    | VLam (t, env) ->
+    | VLam1 (t, env) ->
         TLam (quote (bindings + 1) (eval t (VNeu bindings :: env)))
-    | VApp (t1, t2) -> TApp (quote bindings t1, quote bindings t2)
+    | VLam2 (t, env) ->
+        TLam
+          (TLam
+             (quote (bindings + 2)
+                (eval t (VNeu (bindings + 1) :: VNeu bindings :: env))))
+    | VLam3 (t, env) ->
+        TLam
+          (TLam
+             (TLam
+                (quote (bindings + 3)
+                   (eval t
+                      (VNeu (bindings + 2)
+                      :: VNeu (bindings + 1)
+                      :: VNeu bindings :: env)))))
+    | VApp1 (t1, t2) -> TApp (quote bindings t1, quote bindings t2)
+    | VApp2 (t1, t2, t3) ->
+        TApp (TApp (quote bindings t1, quote bindings t2), quote bindings t3)
+    | VApp3 (t1, t2, t3, t4) ->
+        TApp
+          ( TApp (TApp (quote bindings t1, quote bindings t2), quote bindings t3),
+            quote bindings t4 )
     | VNeu level -> TVar (bindings - level - 1)
 
   let nf (t : tm) : tm = quote 0 (eval t [])
@@ -358,6 +404,7 @@ let benchmark (name : string) ?(runs : int = 5) (expected : tm) (f : int -> tm)
   let rec go totalTime = function
     | 0 -> totalTime
     | n ->
+        Gc.minor ();
         Format.printf "Running '%s' (%i runs remaining)\n@?" name n;
         let startT = Sys.time () in
         let actual = f n in
