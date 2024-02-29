@@ -3,3 +3,8 @@
 .metals
 _build
 *.native
+a.out
+*.cmo
+*.cmi
+*.cmx
+*.o

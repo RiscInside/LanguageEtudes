@@ -10,7 +10,7 @@
 
   - NbE interpreter that does a precompilation step to discover nested
     applications/abstractions. On a huge example (10000 - 10000) this
-    optimization gives 20% speedup
+    optimization gives ~10% speedup
 
   - CPS NbE interpreter. Roughly the same speed as the basic one +
     is guaranteed to use constant amount of stack space. It does allocate
@@ -24,9 +24,8 @@
     PlainEval, so not worth it regardless. Perhaps maybe in C?
   
   - MarshalledTerm. This "marshals" term into a byte array and then evaluates
-    the marshalled term. This appears to run slightly faster than plain eval,
-    but I had to steal some external function declarations from Bytes module
-    to make that happen
+    the marshalled term. It also uses tricks from NestedEval - applications
+    and abstractions are merged. This is roughly 20% faster than PlainEval.
 
   Some ideas I ruled out
 
@@ -34,9 +33,10 @@
     make a difference and in a normal NbE interpreter there would be a big
     spine instead.
 
-  Some ideas I would like to try
-
-  - Encoding (TVar v) variant as Ocaml Integer to save up on space.
+  - Encoding (TVar v) variant as Ocaml Integer to save up on space. I tried this,
+    but it slowed things down due to having to do double dispatch - first checking
+    if something is a runtime integer, then dispatching on the actual runtime
+    representation
 *)
 
 type tm = TLam of tm | TApp of tm * tm | TVar of int
@@ -106,12 +106,12 @@ module NestedEval = struct
     | CTApp3 (f, a1, a2, a3) ->
         apply3 (eval f env) (eval a1 env) (eval a2 env) (eval a3 env)
     | CTApp2 (f, a1, a2) -> apply2 (eval f env) (eval a1 env) (eval a2 env)
-    | CTApp1 (f, a1) -> apply (eval f env) (eval a1 env)
+    | CTApp1 (f, a1) -> apply1 (eval f env) (eval a1 env)
     | CTLam3 t -> VLam3 (t, env)
     | CTLam2 t -> VLam2 (t, env)
     | CTLam1 t -> VLam1 (t, env)
 
-  and apply (f : value) (a : value) : value =
+  and apply1 (f : value) (a : value) : value =
     match f with
     | VLam1 (fb, fenv) -> eval fb (a :: fenv)
     | VLam2 (fb, fenv) -> VLam1 (fb, a :: fenv)
@@ -120,7 +120,7 @@ module NestedEval = struct
 
   and apply2 (f : value) (a1 : value) (a2 : value) =
     match f with
-    | VLam1 (fb, fenv) -> apply (eval fb (a1 :: fenv)) a2
+    | VLam1 (fb, fenv) -> apply1 (eval fb (a1 :: fenv)) a2
     | VLam2 (fb, fenv) -> eval fb (a2 :: a1 :: fenv)
     | VLam3 (fb, fenv) -> VLam1 (fb, a2 :: a1 :: fenv)
     | f -> VApp (VApp (f, a1), a2)
@@ -128,7 +128,7 @@ module NestedEval = struct
   and apply3 (f : value) (a1 : value) (a2 : value) (a3 : value) =
     match f with
     | VLam1 (fb, fenv) -> apply2 (eval fb (a1 :: fenv)) a2 a3
-    | VLam2 (fb, fenv) -> apply (eval fb (a2 :: a1 :: fenv)) a3
+    | VLam2 (fb, fenv) -> apply1 (eval fb (a2 :: a1 :: fenv)) a3
     | VLam3 (fb, fenv) -> eval fb (a3 :: a2 :: a1 :: fenv)
     | f -> VApp (VApp (VApp (f, a1), a2), a3)
 
@@ -290,18 +290,32 @@ module Zinc = struct
   let rec nf (t : tm) : tm = quote 0 (interpret (compile t []) SNil [])
 end
 
-(* Uhh *)
-external unsafe_set_uint16_ne : bytes -> int -> int -> unit
-  = "%caml_bytes_set16u"
+(* Uhh, nothing to see here :^) *)
+external set16u : bytes -> int -> int -> unit = "%caml_bytes_set16u"
+external get16u : bytes -> int -> int = "%caml_bytes_get16u"
 
-external unsafe_get_uint16_ne : bytes -> int -> int = "%caml_bytes_get16u"
+external caml_bytes_set32u : bytes -> int -> int32 -> unit
+  = "%caml_bytes_set32u"
+
+external caml_bytes_get32u : bytes -> int -> int32 = "%caml_bytes_get32u"
+
+let get32u (b : bytes) (i : int) : int = Int32.to_int (caml_bytes_get32u b i)
+[@@inline always]
+
+let set32u (b : bytes) (i : int) (v : int) : unit =
+  caml_bytes_set32u b i (Int32.of_int v)
+[@@inline always]
 
 (* Converting terms to byte sequences *)
 module TermMarshal = struct
-  let byte_var_boundary : int = 0xfc
-  let short_var_marker : char = '\xfd'
-  let app_byte : char = '\xfe'
-  let lam_byte : char = '\xff'
+  let byte_var_boundary : int = 0xf8
+  let far_var_marker : char = '\xf9'
+  let app1_byte : char = '\xfa'
+  let app2_byte : char = '\xfb'
+  let app3_byte : char = '\xfc'
+  let lam1_byte : char = '\xfd'
+  let lam2_byte : char = '\xfe'
+  let lam3_byte : char = '\xff'
 
   type writer = { mutable bytes : bytes; mutable offset : int }
 
@@ -318,37 +332,65 @@ module TermMarshal = struct
   let write_char (w : writer) (c : char) : unit =
     write w 1 (fun b i -> Bytes.unsafe_set b i c)
 
-  let write_uint16 (w : writer) (v : int) : unit =
-    write w 2 (fun b i -> unsafe_set_uint16_ne b i v)
+  let write_uint32 (w : writer) (v : int) : unit =
+    write w 4 (fun b i -> set32u b i v)
 
-  let make_uint16_hole (w : writer) : int =
+  let make_uint32_hole (w : writer) : int =
     let offset = w.offset in
-    write_uint16 w 0;
+    write_uint32 w 0;
     offset
-
-  let fill_uint16_hole (w : writer) (hole : int) (v : int) : unit =
-    Bytes.set_uint16_ne w.bytes hole v
 
   exception MarshallingError of string
 
+  let fill_uint32_hole (w : writer) (hole : int) (v : int) : unit =
+    if v > Int32.to_int Int32.max_int then
+      raise (MarshallingError "can't skip over the term")
+    else set32u w.bytes hole v
+
   let rec marshal (w : writer) (t : tm) : int =
     let rec go (w : writer) : tm -> unit = function
-      | TApp (t1, t2) ->
+      | TApp (TApp (TApp (f, a1), a2), a3) ->
           let start_offset = w.offset in
-          write_char w app_byte;
-          let offset_hole = make_uint16_hole w in
-          go w t1;
-          fill_uint16_hole w offset_hole (w.offset - start_offset);
-          go w t2
+          write_char w app3_byte;
+          let a1_offset_hole = make_uint32_hole w in
+          let a2_offset_hole = make_uint32_hole w in
+          let a3_offset_hole = make_uint32_hole w in
+          push w start_offset a1_offset_hole f;
+          push w start_offset a2_offset_hole a1;
+          push w start_offset a3_offset_hole a2;
+          go w a3
+      | TApp (TApp (f, a1), a2) ->
+          let start_offset = w.offset in
+          write_char w app2_byte;
+          let a1_offset_hole = make_uint32_hole w in
+          let a2_offset_hole = make_uint32_hole w in
+          push w start_offset a1_offset_hole f;
+          push w start_offset a2_offset_hole a1;
+          go w a2
+      | TApp (f, a1) ->
+          let start_offset = w.offset in
+          write_char w app1_byte;
+          let a1_offset_hole = make_uint32_hole w in
+          push w start_offset a1_offset_hole f;
+          go w a1
+      | TLam (TLam (TLam b)) ->
+          write_char w lam3_byte;
+          go w b
+      | TLam (TLam b) ->
+          write_char w lam2_byte;
+          go w b
       | TLam b ->
-          write_char w lam_byte;
+          write_char w lam1_byte;
           go w b
       | TVar v ->
           if v <= byte_var_boundary then write_char w (char_of_int v)
           else if v < 65536 then (
-            write_char w short_var_marker;
-            write_uint16 w v)
+            write_char w far_var_marker;
+            write_uint32 w v)
           else raise (MarshallingError "variable too big")
+    and push (w : writer) (start : int) (hole : int) (arg : tm) =
+      go w arg;
+      fill_uint32_hole w hole (w.offset - start)
     in
 
     let offset = w.offset in
@@ -358,34 +400,89 @@ end
 
 module MarshalledEval = struct
   (* int in VLam represents byte offset into the buffer where marshalled term starts *)
-  type value = VLam of int * value list | VNeu of int | VApp of value * value
+  type value =
+    | VLam1 of int * value list
+    | VLam2 of int * value list
+    | VLam3 of int * value list
+    | VNeu of int
+    | VApp of value * value
 
   let rec eval (b : bytes) (pc : int) (env : value list) : value =
     match Bytes.unsafe_get b pc with
-    | '\xfd' ->
+    | '\xf9' ->
         (* Far variable access *)
-        nth env (unsafe_get_uint16_ne b (pc + 1))
+        nth env (get32u b (pc + 1))
+    | '\xfa' ->
+        (* f a *)
+        let f = eval b (pc + 5) env in
+        let a = eval b (pc + get32u b (pc + 1)) env in
+        apply1 b f a
+    | '\xfb' ->
+        (* f a1 a2 *)
+        let f = eval b (pc + 9) env in
+        let a1 = eval b (pc + get32u b (pc + 1)) env in
+        let a2 = eval b (pc + get32u b (pc + 5)) env in
+        apply2 b f a1 a2
+    | '\xfc' ->
+        (* f a1 a2 a3 *)
+        let f = eval b (pc + 13) env in
+        let a1 = eval b (pc + get32u b (pc + 1)) env in
+        let a2 = eval b (pc + get32u b (pc + 5)) env in
+        let a3 = eval b (pc + get32u b (pc + 9)) env in
+        apply3 b f a1 a2 a3
+    | '\xfd' ->
+        (* \. b *)
+        VLam1 (pc + 1, env)
     | '\xfe' ->
-        (* Function application *)
-        let a_offset = unsafe_get_uint16_ne b (pc + 1) in
-        let f = eval b (pc + 3) env in
-        let a = eval b (pc + a_offset) env in
-        apply b f a
+        (* \. \. b *)
+        VLam2 (pc + 1, env)
     | '\xff' ->
-        (* Lamdba abstraction *)
-        VLam (pc + 1, env)
+        (* \. \. \. b *)
+        VLam3 (pc + 1, env)
     | c ->
         (* Close variable access *)
         nth env (int_of_char c)
 
-  and apply (b : bytes) (f : value) (a : value) : value =
-    match f with VLam (off, env) -> eval b off (a :: env) | _ -> VApp (f, a)
+  and apply1 (b : bytes) (f : value) (a : value) : value =
+    match f with
+    | VLam1 (pc, env) -> eval b pc (a :: env)
+    | VLam2 (pc, env) -> VLam1 (pc, a :: env)
+    | VLam3 (pc, env) -> VLam2 (pc, a :: env)
+    | v -> VApp (v, a)
+
+  and apply2 (b : bytes) (f : value) (a1 : value) (a2 : value) =
+    match f with
+    | VLam1 (pc, env) -> apply1 b (eval b pc (a1 :: env)) a2
+    | VLam2 (pc, env) -> eval b pc (a2 :: a1 :: env)
+    | VLam3 (pc, env) -> VLam1 (pc, a2 :: a1 :: env)
+    | f -> VApp (VApp (f, a1), a2)
+
+  and apply3 (b : bytes) (f : value) (a1 : value) (a2 : value) (a3 : value) =
+    match f with
+    | VLam1 (pc, env) -> apply2 b (eval b pc (a1 :: env)) a2 a3
+    | VLam2 (pc, env) -> apply1 b (eval b pc (a2 :: a1 :: env)) a3
+    | VLam3 (pc, env) -> eval b pc (a3 :: a2 :: a1 :: env)
+    | f -> VApp (VApp (VApp (f, a1), a2), a3)
 
   let rec quote (b : bytes) (bindings : int) : value -> tm = function
     | VNeu lvl -> TVar (bindings - lvl - 1)
     | VApp (v1, v2) -> TApp (quote b bindings v1, quote b bindings v2)
-    | VLam (off, env) ->
-        TLam (quote b (bindings + 1) (eval b off (VNeu bindings :: env)))
+    | VLam1 (pc, env) ->
+        TLam (quote b (bindings + 1) (eval b pc (VNeu bindings :: env)))
+    | VLam2 (pc, env) ->
+        TLam
+          (TLam
+             (quote b (bindings + 2)
+                (eval b pc (VNeu (bindings + 1) :: VNeu bindings :: env))))
+    | VLam3 (pc, env) ->
+        TLam
+          (TLam
+             (TLam
+                (quote b (bindings + 3)
+                   (eval b pc
+                      (VNeu (bindings + 2)
+                      :: VNeu (bindings + 1)
+                      :: VNeu bindings :: env)))))
 
   let rec nf (t : tm) : tm =
     let w = TermMarshal.new_writer () in
@@ -457,9 +554,10 @@ open TestTerm
 
 let benchmark (name : string) ?(runs : int = 5) (expected : tm) (f : int -> tm)
     =
-  let rec go totalTime = function
-    | 0 -> totalTime
+  let rec go acc = function
+    | 0 -> acc
     | n ->
+        Gc.full_major ();
         Format.printf "Running '%s' (%i runs remaining)\n@?" name n;
         let startT = Sys.time () in
         let actual = f n in
@@ -469,19 +567,27 @@ let benchmark (name : string) ?(runs : int = 5) (expected : tm) (f : int -> tm)
             "Incorrect result for '%s'@\nexpected: @[%a@]@\nactual: @[%a@]\n@?"
             name pp_tm expected pp_tm actual;
           exit 1)
-        else go (totalTime +. (endT -. startT)) (n - 1)
+        else go ((endT -. startT) :: acc) (n - 1)
   in
-  Gc.full_major ();
-  let res = go 0.0 runs /. float_of_int runs in
-  Format.printf "'%s' took %f seconds\n@?" name res
+  (* Some time for CPU to calm down. It's fine if this returns 0 *)
+  let _ =
+    if Sys.win32 then Sys.command "timeout /t 5" else Sys.command "sleep 5"
+  in
+  let times = List.fast_sort Float.compare (go [] runs) in
+  let median =
+    if Int.rem runs 2 = 0 then
+      (nth times (runs / 2) +. nth times ((runs / 2) - 1)) /. 2.0
+    else nth times (runs / 2)
+  in
+  Format.printf "Median for '%s' is %f seconds\n@?" name median
 
 let try_all () =
   benchmark "plain NbE (1000 - 1000)" (TLam (TLam (TVar 0))) ~runs:10 (fun _ ->
       PlainEval.nf (testTerm 1000));
   benchmark "nested NbE (1000 - 1000)" (TLam (TLam (TVar 0))) ~runs:10 (fun _ ->
       NestedEval.nf (testTerm 1000));
-  benchmark "plain NbE over marshalled terms (1000 - 1000)"
-    (TLam (TLam (TVar 0))) ~runs:10 (fun _ -> MarshalledEval.nf (testTerm 1000));
+  benchmark "NbE over marshalled terms (1000 - 1000)" (TLam (TLam (TVar 0)))
+    ~runs:10 (fun _ -> MarshalledEval.nf (testTerm 1000));
   benchmark "cps NbE (1000 - 1000)" ~runs:10 (TLam (TLam (TVar 0))) (fun _ ->
       CPSEval.nf (testTerm 1000));
   benchmark "1000 - 1000 on Zinc machine" (TLam (TLam (TVar 0))) (fun _ ->
@@ -490,8 +596,8 @@ let try_all () =
       PlainEval.nf (testTerm 3000));
   benchmark "nested NbE (3000 - 3000)" (TLam (TLam (TVar 0))) (fun _ ->
       PlainEval.nf (testTerm 3000));
-  benchmark "plain NbE over marshalled terms (3000 - 3000)"
-    (TLam (TLam (TVar 0))) (fun _ -> MarshalledEval.nf (testTerm 3000));
+  benchmark "NbE over marshalled terms (3000 - 3000)" (TLam (TLam (TVar 0)))
+    (fun _ -> MarshalledEval.nf (testTerm 3000));
   benchmark "cps NbE (3000 - 3000)" (TLam (TLam (TVar 0))) (fun _ ->
       CPSEval.nf (testTerm 3000));
   benchmark "3000 - 3000 on Zinc machine" (TLam (TLam (TVar 0))) (fun _ ->
@@ -500,14 +606,16 @@ let try_all () =
       PlainEval.nf (testTerm 7000));
   benchmark "nested NbE (7000 - 7000)" (TLam (TLam (TVar 0))) ~runs:3 (fun _ ->
       PlainEval.nf (testTerm 7000));
-  benchmark "plain NbE over marshalled terms (7000 - 7000)"
-    (TLam (TLam (TVar 0))) ~runs:3 (fun _ -> MarshalledEval.nf (testTerm 7000))
+  benchmark "NbE over marshalled terms (7000 - 7000)" (TLam (TLam (TVar 0)))
+    ~runs:3 (fun _ -> MarshalledEval.nf (testTerm 7000))
 
 let huge () =
-  benchmark "plain NbE (10000 - 10000)" (TLam (TLam (TVar 0))) ~runs:3 (fun _ ->
-      PlainEval.nf (testTerm 10000));
-  benchmark "nested NbE (10000 - 10000)" (TLam (TLam (TVar 0))) ~runs:3
-    (fun _ -> PlainEval.nf (testTerm 10000))
+  benchmark "plain NbE (10000 - 10000)" (TLam (TLam (TVar 0))) ~runs:10
+    (fun _ -> Sys.opaque_identity (PlainEval.nf (testTerm 10000)));
+  benchmark "nested NbE (10000 - 10000)" (TLam (TLam (TVar 0))) ~runs:10
+    (fun _ -> Sys.opaque_identity (NestedEval.nf (testTerm 10000)));
+  benchmark "NbE over marshalled terms (10000 - 10000)" (TLam (TLam (TVar 0)))
+    ~runs:10 (fun _ -> Sys.opaque_identity (MarshalledEval.nf (testTerm 10000)))
 
 let many_smol () =
   let term = testTerm 200 in
@@ -516,14 +624,14 @@ let many_smol () =
     (fun _ ->
       let res = ref None in
       for _ = 0 to 1000 do
-        res := Some (PlainEval.nf term)
+        res := Sys.opaque_identity (Some (PlainEval.nf term))
       done;
       Option.get !res);
   benchmark "plain NbE (200 - 200) 1000 times" (TLam (TLam (TVar 0))) ~runs:5
     (fun _ ->
       let res = ref None in
       for _ = 0 to 1000 do
-        res := Some (NestedEval.nf_compiled compiled)
+        res := Sys.opaque_identity (Some (NestedEval.nf_compiled compiled))
       done;
       Option.get !res)
 
@@ -534,14 +642,14 @@ let tiny () =
     (fun _ ->
       let res = ref None in
       for _ = 0 to 100000 do
-        res := Some (PlainEval.nf term)
+        res := Sys.opaque_identity (Some (PlainEval.nf term))
       done;
       Option.get !res);
   benchmark "plain NbE (20 - 20) 100000 times" (TLam (TLam (TVar 0))) ~runs:5
     (fun _ ->
       let res = ref None in
       for _ = 0 to 100000 do
-        res := Some (NestedEval.nf_compiled compiled)
+        res := Sys.opaque_identity (Some (NestedEval.nf_compiled compiled))
       done;
       Option.get !res)
 
