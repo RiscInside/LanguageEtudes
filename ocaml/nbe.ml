@@ -308,11 +308,17 @@ let set32u (b : bytes) (i : int) (v : int) : unit =
 
 (* Converting terms to byte sequences *)
 module TermMarshal = struct
-  let byte_var_boundary : int = 0xf8
-  let far_var_marker : char = '\xf9'
-  let app1_byte : char = '\xfa'
-  let app2_byte : char = '\xfb'
-  let app3_byte : char = '\xfc'
+  exception MarshallingError of string
+
+  let byte_var_boundary : int = 0xf4
+  let short_var_marker : char = '\xf5'
+  let long_var_marker : char = '\xf6'
+  let app1s_byte : char = '\xf7'
+  let app2s_byte : char = '\xf8'
+  let app3s_byte : char = '\xf9'
+  let app1l_byte : char = '\xfa'
+  let app2l_byte : char = '\xfb'
+  let app3l_byte : char = '\xfc'
   let lam1_byte : char = '\xfd'
   let lam2_byte : char = '\xfe'
   let lam3_byte : char = '\xff'
@@ -324,77 +330,184 @@ module TermMarshal = struct
   let grow (w : writer) : unit =
     w.bytes <- Bytes.extend w.bytes 0 (Bytes.length w.bytes)
 
-  let rec write (w : writer) (size : int) (f : bytes -> int -> unit) : unit =
-    if Bytes.length w.bytes < w.offset + size then grow w else ();
-    f w.bytes w.offset;
-    w.offset <- w.offset + size
+  let rec ensure_capacity (w : writer) (min : int) : unit =
+    let remaining = Bytes.length w.bytes - w.offset in
+    if remaining < min then (
+      grow w;
+      ensure_capacity w min)
+    else ()
 
   let write_char (w : writer) (c : char) : unit =
-    write w 1 (fun b i -> Bytes.unsafe_set b i c)
+    Bytes.unsafe_set w.bytes w.offset c;
+    w.offset <- w.offset + 1
+
+  let write_uint16 (w : writer) (v : int) : unit =
+    set16u w.bytes w.offset v;
+    w.offset <- w.offset + 2
 
   let write_uint32 (w : writer) (v : int) : unit =
-    write w 4 (fun b i -> set32u b i v)
+    set32u w.bytes w.offset v;
+    w.offset <- w.offset + 4
 
-  let make_uint32_hole (w : writer) : int =
-    let offset = w.offset in
-    write_uint32 w 0;
-    offset
+  type tm_layout =
+    | InlineVar of char (* 1 byte inline ref *)
+    | ShortVar of int (* \xf5 + 2 bytes de brujin index *)
+    | LongVar of int (* \xf6 + 4 bytes de brujin index (who would need more?) *)
+    (* \xf7 + 2 byte offset of a1 + [[f]] + [[a1]] *)
+    | ShortApp1 of int * tm_layout * tm_layout
+    (* \xf8 + 2 byte offsets of a1 and a2 + [[f]] + [[a1]] + [[a2]] *)
+    | ShortApp2 of int * int * tm_layout * tm_layout * tm_layout
+    (* \xf9 + 2 byte offsets of a1, a2, and a3 + [[f]] + [[a1]] + [[a2]] + [[a3]] *)
+    | ShortApp3 of
+        int * int * int * tm_layout * tm_layout * tm_layout * tm_layout
+    (* \xfa + 4 byte offset of a1 + [[f]] + [[a1]] *)
+    | LongApp1 of int * tm_layout * tm_layout
+    (* \xfb + 4 byte offsets of a1 and a2 + [[f]] + [[a1]] + [[a2]] *)
+    | LongApp2 of int * int * tm_layout * tm_layout * tm_layout
+    (* \xfc + 4 byte offsets of a1, a2, and a3 + [[f]] + [[a1]] + [[a2]] + [[a3]] *)
+    | LongApp3 of
+        int * int * int * tm_layout * tm_layout * tm_layout * tm_layout
+    (* \xfd + [[b]] - lambda accepting at least one argument *)
+    | Lam1Mark of tm_layout
+    (* \xfe + [[b]] - lambda accepting at least two arguments *)
+    | Lam2Mark of tm_layout
+    (* \xff + [[b]] - lambda accepting at least three arguments *)
+    | Lam3Mark of tm_layout
 
-  exception MarshallingError of string
-
-  let fill_uint32_hole (w : writer) (hole : int) (v : int) : unit =
-    if v > Int32.to_int Int32.max_int then
-      raise (MarshallingError "can't skip over the term")
-    else set32u w.bytes hole v
+  let rec build_layout (size : int ref) : tm -> tm_layout = function
+    | TVar i ->
+        if i <= byte_var_boundary then (
+          incr size;
+          InlineVar (Char.chr i))
+        else if i <= 32767 then (
+          (* TODO - use unsigned repr *)
+          size := !size + 3;
+          ShortVar i)
+        else (
+          assert (!size <= Int32.to_int Int32.max_int);
+          size := !size + 5;
+          LongVar i)
+    | TApp (TApp (TApp (f, a1), a2), a3) ->
+        let size_before = !size in
+        let lf = build_layout size f in
+        let a1_offset = !size - size_before in
+        let la1 = build_layout size a1 in
+        let a2_offset = !size - size_before in
+        let la2 = build_layout size a2 in
+        let a3_offset = !size - size_before in
+        let la3 = build_layout size a3 in
+        if a3_offset <= 32767 - 7 then (
+          (* 3 short fields and 1 header byte *)
+          size := !size + 7;
+          ShortApp3
+            (a1_offset + 7, a2_offset + 7, a3_offset + 7, lf, la1, la2, la3))
+        else (
+          size := !size + 13;
+          LongApp3
+            (a1_offset + 13, a2_offset + 13, a3_offset + 13, lf, la1, la2, la3))
+    | TApp (TApp (f, a1), a2) ->
+        let size_before = !size in
+        let lf = build_layout size f in
+        let a1_offset = !size - size_before in
+        let la1 = build_layout size a1 in
+        let a2_offset = !size - size_before in
+        let la2 = build_layout size a2 in
+        if a2_offset <= 32767 - 5 then (
+          (* 2 short fields and 1 header byte *)
+          size := !size + 5;
+          ShortApp2 (a1_offset + 5, a2_offset + 5, lf, la1, la2))
+        else (
+          size := !size + 9;
+          LongApp2 (a1_offset + 9, a2_offset + 9, lf, la1, la2))
+    | TApp (f, a1) ->
+        let size_before = !size in
+        let lf = build_layout size f in
+        let a1_offset = !size - size_before in
+        let la1 = build_layout size a1 in
+        if a1_offset <= 32767 - 3 then (
+          (* 1 short field and 1 header byte *)
+          size := !size + 3;
+          ShortApp1 (a1_offset + 3, lf, la1))
+        else (
+          size := !size + 5;
+          LongApp1 (a1_offset + 5, lf, la1))
+    | TLam (TLam (TLam t)) ->
+        incr size;
+        Lam3Mark (build_layout size t)
+    | TLam (TLam t) ->
+        incr size;
+        Lam2Mark (build_layout size t)
+    | TLam t ->
+        incr size;
+        Lam1Mark (build_layout size t)
 
   let rec marshal (w : writer) (t : tm) : int =
-    let rec go (w : writer) : tm -> unit = function
-      | TApp (TApp (TApp (f, a1), a2), a3) ->
-          let start_offset = w.offset in
-          write_char w app3_byte;
-          let a1_offset_hole = make_uint32_hole w in
-          let a2_offset_hole = make_uint32_hole w in
-          let a3_offset_hole = make_uint32_hole w in
-          push w start_offset a1_offset_hole f;
-          push w start_offset a2_offset_hole a1;
-          push w start_offset a3_offset_hole a2;
-          go w a3
-      | TApp (TApp (f, a1), a2) ->
-          let start_offset = w.offset in
-          write_char w app2_byte;
-          let a1_offset_hole = make_uint32_hole w in
-          let a2_offset_hole = make_uint32_hole w in
-          push w start_offset a1_offset_hole f;
-          push w start_offset a2_offset_hole a1;
-          go w a2
-      | TApp (f, a1) ->
-          let start_offset = w.offset in
-          write_char w app1_byte;
-          let a1_offset_hole = make_uint32_hole w in
-          push w start_offset a1_offset_hole f;
+    let rec go (w : writer) : tm_layout -> unit = function
+      | InlineVar c -> write_char w c
+      | ShortVar i ->
+          write_char w short_var_marker;
+          write_uint16 w i
+      | LongVar i ->
+          write_char w long_var_marker;
+          write_uint32 w i
+      | ShortApp1 (a1off, f, a1) ->
+          write_char w app1s_byte;
+          write_uint16 w a1off;
+          go w f;
           go w a1
-      | TLam (TLam (TLam b)) ->
-          write_char w lam3_byte;
-          go w b
-      | TLam (TLam b) ->
-          write_char w lam2_byte;
-          go w b
-      | TLam b ->
+      | ShortApp2 (a1off, a2off, f, a1, a2) ->
+          write_char w app2s_byte;
+          write_uint16 w a1off;
+          write_uint16 w a2off;
+          go w f;
+          go w a1;
+          go w a2
+      | ShortApp3 (a1off, a2off, a3off, f, a1, a2, a3) ->
+          write_char w app3s_byte;
+          write_uint16 w a1off;
+          write_uint16 w a2off;
+          write_uint16 w a3off;
+          go w f;
+          go w a1;
+          go w a2;
+          go w a3
+      | LongApp1 (a1off, f, a1) ->
+          write_char w app1l_byte;
+          write_uint32 w a1off;
+          go w f;
+          go w a1
+      | LongApp2 (a1off, a2off, f, a1, a2) ->
+          write_char w app2l_byte;
+          write_uint32 w a1off;
+          write_uint32 w a2off;
+          go w f;
+          go w a1;
+          go w a2
+      | LongApp3 (a1off, a2off, a3off, f, a1, a2, a3) ->
+          write_char w app3l_byte;
+          write_uint32 w a1off;
+          write_uint32 w a2off;
+          write_uint32 w a3off;
+          go w f;
+          go w a1;
+          go w a2;
+          go w a3
+      | Lam1Mark b ->
           write_char w lam1_byte;
           go w b
-      | TVar v ->
-          if v <= byte_var_boundary then write_char w (char_of_int v)
-          else if v < 65536 then (
-            write_char w far_var_marker;
-            write_uint32 w v)
-          else raise (MarshallingError "variable too big")
-    and push (w : writer) (start : int) (hole : int) (arg : tm) =
-      go w arg;
-      fill_uint32_hole w hole (w.offset - start)
+      | Lam2Mark b ->
+          write_char w lam2_byte;
+          go w b
+      | Lam3Mark b ->
+          write_char w lam3_byte;
+          go w b
     in
 
     let offset = w.offset in
-    go w t;
+    let size_ref = ref 0 in
+    let layout = build_layout size_ref t in
+    ensure_capacity w !size_ref;
+    go w layout;
     offset
 end
 
@@ -409,22 +522,43 @@ module MarshalledEval = struct
 
   let rec eval (b : bytes) (pc : int) (env : value list) : value =
     match Bytes.unsafe_get b pc with
-    | '\xf9' ->
-        (* Far variable access *)
+    | '\xf5' ->
+        (* 16-bit indexed variable access *)
+        nth env (get16u b (pc + 1))
+    | '\xf6' ->
+        (* 32-bit indexed variable access *)
         nth env (get32u b (pc + 1))
-    | '\xfa' ->
-        (* f a *)
+    | '\xf7' ->
+        (* f a1 with short offsets *)
+        let f = eval b (pc + 3) env in
+        let a1 = eval b (pc + get16u b (pc + 1)) env in
+        apply1 b f a1
+    | '\xf8' ->
+        (* f a1 a2 with short offsets *)
         let f = eval b (pc + 5) env in
-        let a = eval b (pc + get32u b (pc + 1)) env in
-        apply1 b f a
+        let a1 = eval b (pc + get16u b (pc + 1)) env in
+        let a2 = eval b (pc + get16u b (pc + 3)) env in
+        apply2 b f a1 a2
+    | '\xf9' ->
+        (* f a1 a2 a3 with short offsets *)
+        let f = eval b (pc + 7) env in
+        let a1 = eval b (pc + get16u b (pc + 1)) env in
+        let a2 = eval b (pc + get16u b (pc + 3)) env in
+        let a3 = eval b (pc + get16u b (pc + 5)) env in
+        apply3 b f a1 a2 a3
+    | '\xfa' ->
+        (* f a1 with long offsets *)
+        let f = eval b (pc + 5) env in
+        let a1 = eval b (pc + get32u b (pc + 1)) env in
+        apply1 b f a1
     | '\xfb' ->
-        (* f a1 a2 *)
+        (* f a1 a2 with long offsets *)
         let f = eval b (pc + 9) env in
         let a1 = eval b (pc + get32u b (pc + 1)) env in
         let a2 = eval b (pc + get32u b (pc + 5)) env in
         apply2 b f a1 a2
     | '\xfc' ->
-        (* f a1 a2 a3 *)
+        (* f a1 a2 a3 with long offsets *)
         let f = eval b (pc + 13) env in
         let a1 = eval b (pc + get32u b (pc + 1)) env in
         let a2 = eval b (pc + get32u b (pc + 5)) env in
@@ -443,12 +577,12 @@ module MarshalledEval = struct
         (* Close variable access *)
         nth env (int_of_char c)
 
-  and apply1 (b : bytes) (f : value) (a : value) : value =
+  and apply1 (b : bytes) (f : value) (a1 : value) : value =
     match f with
-    | VLam1 (pc, env) -> eval b pc (a :: env)
-    | VLam2 (pc, env) -> VLam1 (pc, a :: env)
-    | VLam3 (pc, env) -> VLam2 (pc, a :: env)
-    | v -> VApp (v, a)
+    | VLam1 (pc, env) -> eval b pc (a1 :: env)
+    | VLam2 (pc, env) -> VLam1 (pc, a1 :: env)
+    | VLam3 (pc, env) -> VLam2 (pc, a1 :: env)
+    | f -> VApp (f, a1)
 
   and apply2 (b : bytes) (f : value) (a1 : value) (a2 : value) =
     match f with
@@ -609,13 +743,13 @@ let try_all () =
   benchmark "NbE over marshalled terms (7000 - 7000)" (TLam (TLam (TVar 0)))
     ~runs:3 (fun _ -> MarshalledEval.nf (testTerm 7000))
 
-let huge () =
-  benchmark "plain NbE (10000 - 10000)" (TLam (TLam (TVar 0))) ~runs:10
-    (fun _ -> Sys.opaque_identity (PlainEval.nf (testTerm 10000)));
-  benchmark "nested NbE (10000 - 10000)" (TLam (TLam (TVar 0))) ~runs:10
-    (fun _ -> Sys.opaque_identity (NestedEval.nf (testTerm 10000)));
+let huge n =
   benchmark "NbE over marshalled terms (10000 - 10000)" (TLam (TLam (TVar 0)))
-    ~runs:10 (fun _ -> Sys.opaque_identity (MarshalledEval.nf (testTerm 10000)))
+    ~runs:n (fun _ -> Sys.opaque_identity (MarshalledEval.nf (testTerm 10000)));
+  benchmark "plain NbE (10000 - 10000)" (TLam (TLam (TVar 0))) ~runs:n (fun _ ->
+      Sys.opaque_identity (PlainEval.nf (testTerm 10000)));
+  benchmark "nested NbE (10000 - 10000)" (TLam (TLam (TVar 0))) ~runs:n
+    (fun _ -> Sys.opaque_identity (NestedEval.nf (testTerm 10000)))
 
 let many_smol () =
   let term = testTerm 200 in
@@ -653,4 +787,4 @@ let tiny () =
       done;
       Option.get !res)
 
-let () = huge ()
+let () = huge 10
