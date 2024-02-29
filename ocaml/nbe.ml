@@ -310,9 +310,21 @@ let set32u (b : bytes) (i : int) (v : int) : unit =
 module TermMarshal = struct
   exception MarshallingError of string
 
-  let byte_var_boundary : int = 0xf4
-  let short_var_marker : char = '\xf5'
-  let long_var_marker : char = '\xf6'
+  let byte_var_boundary : int = 0xe8
+  let short_var_marker : char = '\xe9'
+  let long_var_marker : char = '\xea'
+  let vsapp1s_byte : char = '\xeb'
+  let vsapp2s_byte : char = '\xec'
+  let vsapp3s_byte : char = '\xed'
+  let vsapp1l_byte : char = '\xee'
+  let vsapp2l_byte : char = '\xef'
+  let vsapp3l_byte : char = '\xf0'
+  let vapp1s_byte : char = '\xf1'
+  let vapp2s_byte : char = '\xf2'
+  let vapp3s_byte : char = '\xf3'
+  let vapp1l_byte : char = '\xf4'
+  let vapp2l_byte : char = '\xf5'
+  let vapp3l_byte : char = '\xf6'
   let app1s_byte : char = '\xf7'
   let app2s_byte : char = '\xf8'
   let app3s_byte : char = '\xf9'
@@ -351,8 +363,32 @@ module TermMarshal = struct
 
   type tm_layout =
     | InlineVar of char (* 1 byte inline ref *)
-    | ShortVar of int (* \xf5 + 2 bytes de brujin index *)
-    | LongVar of int (* \xf6 + 4 bytes de brujin index (who would need more?) *)
+    | ShortVar of int (* \xe9 + 2 bytes de brujin index *)
+    | LongVar of int (* \xea + 4 bytes de brujin index (who would need more?) *)
+    (* \xeb + 2x 2 byte args *)
+    | ShortVarsOnlyApp1 of int * int
+    (* \xec + 3x 2 byte args *)
+    | ShortVarsOnlyApp2 of int * int * int
+    (* \xed + 4x 2 byte args *)
+    | ShortVarsOnlyApp3 of int * int * int * int
+    (* \xee + 2x 4 byte variable indices *)
+    | LongVarsOnlyApp1 of int * int
+    (* \xef + 3x 4 byte variable indices *)
+    | LongVarsOnlyApp2 of int * int * int
+    (* \xf0 + 4x 4 byte variable indices *)
+    | LongVarsOnlyApp3 of int * int * int * int
+    (* \xf1 + 2 byte variable index + [[a1]] *)
+    | ShortVarApp1 of int * tm_layout
+    (* \xf2 + 2 byte variable index + 2 byte offset + [[a1]] + [[a2]] *)
+    | ShortVarApp2 of int * int * tm_layout * tm_layout
+    (* \xf3 + 2 byte variable index + 2x 2 byte offsets + [[a1]] + [[a2]] + [[a3]] *)
+    | ShortVarApp3 of int * int * int * tm_layout * tm_layout * tm_layout
+    (* \xf4 + 4 byte variable index + [[a1]] *)
+    | LongVarApp1 of int * tm_layout
+    (* \xf5 + 4 byte variable index + 4 byte offset + [[a1]] + [[a2]] *)
+    | LongVarApp2 of int * int * tm_layout * tm_layout
+    (* \xf3 + 4 byte variable index + 2x 4 byte offsets + [[a1]] + [[a2]] + [[a3]] *)
+    | LongVarApp3 of int * int * int * tm_layout * tm_layout * tm_layout
     (* \xf7 + 2 byte offset of a1 + [[f]] + [[a1]] *)
     | ShortApp1 of int * tm_layout * tm_layout
     (* \xf8 + 2 byte offsets of a1 and a2 + [[f]] + [[a1]] + [[a2]] *)
@@ -387,6 +423,61 @@ module TermMarshal = struct
           assert (!size <= Int32.to_int Int32.max_int);
           size := !size + 5;
           LongVar i)
+    | TApp (TApp (TApp (TVar v1, TVar v2), TVar v3), TVar v4) ->
+        if v1 <= 32767 && v2 <= 32767 && v3 <= 32767 && v4 <= 32767 then (
+          size := !size + 9;
+          ShortVarsOnlyApp3 (v1, v2, v3, v4))
+        else (
+          size := !size + 17;
+          LongVarsOnlyApp3 (v1, v2, v3, v4))
+    | TApp (TApp (TVar v1, TVar v2), TVar v3) ->
+        if v1 <= 32767 && v2 <= 32767 && v3 <= 32767 then (
+          size := !size + 7;
+          ShortVarsOnlyApp2 (v1, v2, v3))
+        else (
+          size := !size + 13;
+          LongVarsOnlyApp2 (v1, v2, v3))
+    | TApp (TVar v1, TVar v2) ->
+        if v1 <= 32767 && v2 <= 32767 then (
+          size := !size + 5;
+          ShortVarsOnlyApp1 (v1, v2))
+        else (
+          size := !size + 9;
+          LongVarsOnlyApp1 (v1, v2))
+    | TApp (TApp (TApp (TVar v, a1), a2), a3) ->
+        let size_before = !size in
+        let la1 = build_layout size a1 in
+        let a2_offset = !size - size_before in
+        let la2 = build_layout size a2 in
+        let a3_offset = !size - size_before in
+        let la3 = build_layout size a3 in
+        if v <= 32767 && a3_offset <= 32767 - 7 then (
+          (* 3 short fields and 1 header byte *)
+          size := !size + 7;
+          ShortVarApp3 (v, a2_offset + 7, a3_offset + 7, la1, la2, la3))
+        else (
+          size := !size + 13;
+          LongVarApp3 (v, a2_offset + 13, a3_offset + 13, la1, la2, la3))
+    | TApp (TApp (TVar v, a1), a2) ->
+        let size_before = !size in
+        let la1 = build_layout size a1 in
+        let a2_offset = !size - size_before in
+        let la2 = build_layout size a2 in
+        if v <= 32767 && a2_offset <= 32767 - 5 then (
+          (* 2 short fields and 1 header byte *)
+          size := !size + 5;
+          ShortVarApp2 (v, a2_offset + 5, la1, la2))
+        else (
+          size := !size + 9;
+          LongVarApp2 (v, a2_offset + 9, la1, la2))
+    | TApp (TVar v, a1) ->
+        let la1 = build_layout size a1 in
+        if v <= 32767 then (
+          size := !size + 3;
+          ShortVarApp1 (v, la1))
+        else (
+          size := !size + 5;
+          LongVarApp1 (v, la1))
     | TApp (TApp (TApp (f, a1), a2), a3) ->
         let size_before = !size in
         let lf = build_layout size f in
@@ -442,65 +533,111 @@ module TermMarshal = struct
         Lam1Mark (build_layout size t)
 
   let rec marshal (w : writer) (t : tm) : int =
+    let write_hdr1 (f : writer -> int -> unit) (w : writer) (c : char)
+        (h1 : int) : unit =
+      write_char w c;
+      f w h1
+        [@@inline always]
+    in
+    let write_hdr2 (f : writer -> int -> unit) (w : writer) (c : char)
+        (h1 : int) (h2 : int) : unit =
+      write_char w c;
+      f w h1;
+      f w h2
+        [@@inline always]
+    in
+
+    let write_hdr3 (f : writer -> int -> unit) (w : writer) (c : char)
+        (h1 : int) (h2 : int) (h3 : int) : unit =
+      write_char w c;
+      f w h1;
+      f w h2;
+      f w h3
+        [@@inline always]
+    in
+
+    let write_hdr4 (f : writer -> int -> unit) (w : writer) (c : char)
+        (h1 : int) (h2 : int) (h3 : int) (h4 : int) : unit =
+      write_char w c;
+      f w h1;
+      f w h2;
+      f w h3;
+      f w h4
+        [@@inline always]
+    in
+
     let rec go (w : writer) : tm_layout -> unit = function
       | InlineVar c -> write_char w c
-      | ShortVar i ->
-          write_char w short_var_marker;
-          write_uint16 w i
-      | LongVar i ->
-          write_char w long_var_marker;
-          write_uint32 w i
+      | ShortVar i -> write_hdr1 write_uint16 w short_var_marker i
+      | LongVar i -> write_hdr1 write_uint32 w short_var_marker i
+      | ShortVarsOnlyApp1 (v1, v2) ->
+          write_hdr2 write_uint16 w vsapp1s_byte v1 v2
+      | ShortVarsOnlyApp2 (v1, v2, v3) ->
+          write_hdr3 write_uint16 w vsapp2s_byte v1 v2 v3
+      | ShortVarsOnlyApp3 (v1, v2, v3, v4) ->
+          write_hdr4 write_uint16 w vsapp3s_byte v1 v2 v3 v4
+      | LongVarsOnlyApp1 (v1, v2) ->
+          write_hdr2 write_uint32 w vsapp1l_byte v1 v2
+      | LongVarsOnlyApp2 (v1, v2, v3) ->
+          write_hdr3 write_uint32 w vsapp2l_byte v1 v2 v3
+      | LongVarsOnlyApp3 (v1, v2, v3, v4) ->
+          write_hdr4 write_uint32 w vsapp3l_byte v1 v2 v3 v4
+      | ShortVarApp1 (fv, a1) ->
+          write_hdr1 write_uint16 w vapp1s_byte fv;
+          go w a1
+      | ShortVarApp2 (fv, a1off, a1, a2) ->
+          write_hdr2 write_uint16 w vapp2s_byte fv a1off;
+          go2 w a1 a2
+      | ShortVarApp3 (fv, a1off, a2off, a1, a2, a3) ->
+          write_hdr3 write_uint16 w vapp3s_byte fv a1off a2off;
+          go3 w a1 a2 a3
+      | LongVarApp1 (fv, a1) ->
+          write_hdr1 write_uint32 w vapp1l_byte fv;
+          go w a1
+      | LongVarApp2 (fv, a1off, a1, a2) ->
+          write_hdr2 write_uint32 w vapp2l_byte fv a1off;
+          go2 w a1 a2
+      | LongVarApp3 (fv, a1off, a2off, a1, a2, a3) ->
+          write_hdr3 write_uint32 w vapp3l_byte fv a1off a2off;
+          go3 w a1 a2 a3
       | ShortApp1 (a1off, f, a1) ->
-          write_char w app1s_byte;
-          write_uint16 w a1off;
-          go w f;
-          go w a1
+          write_hdr1 write_uint16 w app1s_byte a1off;
+          go2 w f a1
       | ShortApp2 (a1off, a2off, f, a1, a2) ->
-          write_char w app2s_byte;
-          write_uint16 w a1off;
-          write_uint16 w a2off;
-          go w f;
-          go w a1;
-          go w a2
+          write_hdr2 write_uint16 w app2s_byte a1off a2off;
+          go3 w f a1 a2
       | ShortApp3 (a1off, a2off, a3off, f, a1, a2, a3) ->
-          write_char w app3s_byte;
-          write_uint16 w a1off;
-          write_uint16 w a2off;
-          write_uint16 w a3off;
-          go w f;
-          go w a1;
-          go w a2;
-          go w a3
+          write_hdr3 write_uint16 w app3s_byte a1off a2off a3off;
+          go4 w f a1 a2 a3
       | LongApp1 (a1off, f, a1) ->
-          write_char w app1l_byte;
-          write_uint32 w a1off;
-          go w f;
-          go w a1
+          write_hdr1 write_uint32 w app1l_byte a1off;
+          go2 w f a1
       | LongApp2 (a1off, a2off, f, a1, a2) ->
-          write_char w app2l_byte;
-          write_uint32 w a1off;
-          write_uint32 w a2off;
-          go w f;
-          go w a1;
-          go w a2
+          write_hdr2 write_uint32 w app2l_byte a1off a2off;
+          go3 w f a1 a2
       | LongApp3 (a1off, a2off, a3off, f, a1, a2, a3) ->
-          write_char w app3l_byte;
-          write_uint32 w a1off;
-          write_uint32 w a2off;
-          write_uint32 w a3off;
-          go w f;
-          go w a1;
-          go w a2;
-          go w a3
-      | Lam1Mark b ->
-          write_char w lam1_byte;
-          go w b
-      | Lam2Mark b ->
-          write_char w lam2_byte;
-          go w b
-      | Lam3Mark b ->
-          write_char w lam3_byte;
-          go w b
+          write_hdr3 write_uint16 w app3l_byte a1off a2off a3off;
+          go4 w f a1 a2 a3
+      | Lam1Mark b -> char_and_go w lam1_byte b
+      | Lam2Mark b -> char_and_go w lam2_byte b
+      | Lam3Mark b -> char_and_go w lam3_byte b
+    and go2 (w : writer) (t1 : tm_layout) (t2 : tm_layout) : unit =
+      go w t1;
+      go w t2
+    and go3 (w : writer) (t1 : tm_layout) (t2 : tm_layout) (t3 : tm_layout) :
+        unit =
+      go w t1;
+      go w t2;
+      go w t3
+    and go4 (w : writer) (t1 : tm_layout) (t2 : tm_layout) (t3 : tm_layout)
+        (t4 : tm_layout) : unit =
+      go w t1;
+      go w t2;
+      go w t3;
+      go w t4
+    and char_and_go (w : writer) (c : char) (t : tm_layout) =
+      write_char w c;
+      go w t
     in
 
     let offset = w.offset in
@@ -522,12 +659,84 @@ module MarshalledEval = struct
 
   let rec eval (b : bytes) (pc : int) (env : value list) : value =
     match Bytes.unsafe_get b pc with
-    | '\xf5' ->
+    | '\xe9' ->
         (* 16-bit indexed variable access *)
         nth env (get16u b (pc + 1))
-    | '\xf6' ->
+    | '\xea' ->
         (* 32-bit indexed variable access *)
         nth env (get32u b (pc + 1))
+    | '\xeb' ->
+        (* (var f) (var a1) with short offsets *)
+        let f = nth env (get16u b (pc + 1)) in
+        let a1 = nth env (get16u b (pc + 3)) in
+        apply1 b f a1
+    | '\xec' ->
+        (* (var f) (var a1) (var a2) with short offsets *)
+        let f = nth env (get16u b (pc + 1)) in
+        let a1 = nth env (get16u b (pc + 3)) in
+        let a2 = nth env (get16u b (pc + 5)) in
+        apply2 b f a1 a2
+    | '\xed' ->
+        (* (var f) (var a1) (var a2) (var a3) with short offsets *)
+        let f = nth env (get16u b (pc + 1)) in
+        let a1 = nth env (get16u b (pc + 3)) in
+        let a2 = nth env (get16u b (pc + 5)) in
+        let a3 = nth env (get16u b (pc + 7)) in
+        apply3 b f a1 a2 a3
+    | '\xee' ->
+        (* (var f) (var a1) with long offsets *)
+        let f = nth env (get32u b (pc + 1)) in
+        let a1 = nth env (get32u b (pc + 5)) in
+        apply1 b f a1
+    | '\xef' ->
+        (* (var f) (var a1) (var a2) with long offsets *)
+        let f = nth env (get16u b (pc + 1)) in
+        let a1 = nth env (get16u b (pc + 5)) in
+        let a2 = nth env (get16u b (pc + 9)) in
+        apply2 b f a1 a2
+    | '\xf0' ->
+        (* (var f) (var a1) (var a2) (var a3) with long offsets *)
+        let f = nth env (get16u b (pc + 1)) in
+        let a1 = nth env (get16u b (pc + 5)) in
+        let a2 = nth env (get16u b (pc + 9)) in
+        let a3 = nth env (get16u b (pc + 13)) in
+        apply3 b f a1 a2 a3
+    | '\xf1' ->
+        (* (var v) a1 with short offsets *)
+        let f = nth env (get16u b (pc + 1)) in
+        let a1 = eval b (pc + 3) env in
+        apply1 b f a1
+    | '\xf2' ->
+        (* (var v) a1 a2 with short offsets *)
+        let f = nth env (get16u b (pc + 1)) in
+        let a1 = eval b (pc + 5) env in
+        let a2 = eval b (pc + get16u b (pc + 3)) env in
+        apply2 b f a1 a2
+    | '\xf3' ->
+        (* (var v) a1 a2 a3 with short offsets *)
+        let f = nth env (get16u b (pc + 1)) in
+        let a1 = eval b (pc + 7) env in
+        let a2 = eval b (pc + get16u b (pc + 3)) env in
+        let a3 = eval b (pc + get16u b (pc + 5)) env in
+        apply3 b f a1 a2 a3
+    | '\xf4' ->
+        (* (var v) a1 with long offsets *)
+        let f = nth env (get32u b (pc + 1)) in
+        let a1 = eval b (pc + 5) env in
+        apply1 b f a1
+    | '\xf5' ->
+        (* (var v) a1 a2 with long offsets *)
+        let f = nth env (get32u b (pc + 1)) in
+        let a1 = eval b (pc + 9) env in
+        let a2 = eval b (pc + get32u b (pc + 5)) env in
+        apply2 b f a1 a2
+    | '\xf6' ->
+        (* (var v) a1 a2 a3 with long offsets *)
+        let f = nth env (get32u b (pc + 1)) in
+        let a1 = eval b (pc + 13) env in
+        let a2 = eval b (pc + get32u b (pc + 5)) env in
+        let a3 = eval b (pc + get32u b (pc + 9)) env in
+        apply3 b f a1 a2 a3
     | '\xf7' ->
         (* f a1 with short offsets *)
         let f = eval b (pc + 3) env in
@@ -787,4 +996,4 @@ let tiny () =
       done;
       Option.get !res)
 
-let () = huge 10
+let () = huge 20
