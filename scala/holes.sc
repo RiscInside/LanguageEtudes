@@ -792,7 +792,7 @@ object TypecheckExamples:
   )(U)
 
 val example: Raw =
-  if args.length == 0 then TypecheckExamples.ex03Holes
+  if args.length == 0 then TypecheckExamples.ex1
   else
     args(0) match
       case "ex0"   => TypecheckExamples.ex0
